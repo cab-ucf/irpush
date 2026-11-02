@@ -1,8 +1,9 @@
 //! End to end over an in-process relay: pairing (with a late host), mesh introduction, pushes from
-//! two hosts, offline queueing, revocation, and refusal to overwrite an identity.
+//! two hosts, offline queueing, revocation, refusal to overwrite an identity, and one node shared by
+//! several apps over the local socket.
 use iroh_base::EndpointId;
 use iroh_relay::server::{RelayConfig, Server, ServerConfig};
-use irpush::{App, Node, Relay, Role, app, random32};
+use irpush::{App, Local, Node, Relay, Role, app, local, random32};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::{sync::mpsc, task::JoinHandle, time::{sleep, timeout}};
 
@@ -25,6 +26,12 @@ fn dir() -> PathBuf {
 fn run(n: Arc<Node>) -> (JoinHandle<()>, Rx) {
     let (tx, rx) = mpsc::unbounded_channel();
     (tokio::spawn(async move { let _ = n.run(move |f, a, d| { let _ = tx.send((f, a, d.to_vec())); }).await; }), rx)
+}
+
+/// Device run loop as an app owner would wrap it: attached apps first, the owner's callback otherwise.
+fn run_shared(n: Arc<Node>, local: Arc<Local>) -> (JoinHandle<()>, Rx) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    (tokio::spawn(async move { let _ = n.run(move |f, a, d| if !local.deliver(f, a, d) { let _ = tx.send((f, a, d.to_vec())); }).await; }), rx)
 }
 
 async fn until(f: impl Fn() -> bool) {
@@ -82,4 +89,41 @@ async fn mesh() {
     assert!(h1.push(id, &a, b"x").is_err());
     assert!(Node::open(d1.join("s"), random32(), vec![]).is_err(), "wrong state key");
     for d in [d1, d2, d3] { let _ = std::fs::remove_dir_all(d); }
+}
+
+/// One node per phone: a second app attaches over the local socket and gets its pushes; pushes for
+/// apps nobody attached fall through to the owner; the owner refuses an attach it does not allow.
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_node() {
+    let (_relay, r) = relay().await;
+    let (dh, dd) = (dir(), dir());
+    let h = Arc::new(Node::create(dh.join("s"), random32(), vec![r.clone()]).unwrap());
+    let dev = Arc::new(Node::join(dd.join("s"), random32(), &h.ticket(Role::Device).unwrap(), vec![]).unwrap());
+    let (_th, _) = run(h.clone());
+    let local = Arc::new(Local::default());
+    let (_td, mut owner_rx) = run_shared(dev.clone(), local.clone());
+    until(|| dev.peers().len() == 1 && h.peers().len() == 1).await;
+
+    let sock = if cfg!(any(target_os = "linux", target_os = "android")) { format!("@irpush-test-{}", hex::encode(&random32()[..4])) } else { dd.join("sock").to_string_lossy().into_owned() };
+    let (a, b, denied) = (app("org.example.a"), app("org.example.b"), app("org.example.denied"));
+    let allowed = move |_uid: Option<u32>, apps: &std::collections::HashSet<App>| !apps.contains(&denied);
+    tokio::spawn(local::serve(dev.clone(), local.clone(), local::bind(&sock).unwrap(), allowed, |_, _, _| anyhow::bail!("no commands")));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let (atx, mut arx) = mpsc::unbounded_channel();
+    let (ltx, mut lrx) = mpsc::unbounded_channel();
+    let id = local::attach(&sock, &[a], move |f, ap, d| { let _ = atx.send((f, ap, d.to_vec())); }, move || { let _ = ltx.send(()); }).unwrap();
+    assert_eq!(id, dev.id(), "attached apps learn the shared device id");
+    assert!(local::attach(&sock, &[denied], |_, _, _| {}, || {}).is_err(), "owner's allow() is enforced");
+    assert!(local::bind(&sock).is_err(), "the socket is the election: a second owner cannot bind");
+
+    h.push(id, &a, b"for app a").unwrap();
+    assert_eq!(recv(&mut arx).await, (h.id(), a, b"for app a".to_vec()));
+    h.push(id, &b, b"for app b").unwrap();
+    assert_eq!(recv(&mut owner_rx).await, (h.id(), b, b"for app b".to_vec()), "unattached apps reach the owner's callback");
+    assert!(timeout(Duration::from_millis(300), arx.recv()).await.is_err(), "app a never sees app b's push");
+
+    drop(_td);
+    for d in [dh, dd] { let _ = std::fs::remove_dir_all(d); }
+    let _ = lrx.try_recv();
 }

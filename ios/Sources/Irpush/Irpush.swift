@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import IrpushC
 import Network
@@ -9,6 +10,8 @@ import UIKit
 
 /// irpush for iOS. Info.plist (app and extension): `IrpushGroup` = App Group (also the shared
 /// Keychain access group); app only, optional: `IrpushRelays` = "https://push.you.example#hextoken".
+/// iOS forbids sockets across apps, so apps of one team share the identity through the App Group
+/// (one device id, one APNs route per app); each foreground app holds the socket while it runs.
 public enum Irpush {
     public typealias Handler = (_ from: Data, _ app: Data, _ data: Data) -> Void
     nonisolated(unsafe) static var handler: Handler = { _, _, _ in }
@@ -60,7 +63,10 @@ public enum Irpush {
         let ok = !FileManager.default.fileExists(atPath: path) && ticket != nil ? irp_join(path, k, ticket!, relays, cb, nil) == 0 : irp_open(path, k, relays, cb, nil) == 0
         guard ok else { return false }
         let m = NWPathMonitor()
-        m.pathUpdateHandler = { p in irp_network(UInt64(bitPattern: Int64(p.availableInterfaces.first?.name.hashValue ?? 0))) }
+        m.pathUpdateHandler = { p in // hashValue is reseeded per launch: the learned heartbeat must key on a stable id
+            let d = SHA256.hash(data: Data((p.availableInterfaces.first?.name ?? "").utf8))
+            irp_network(d.prefix(8).reduce(UInt64(0)) { $0 << 8 | UInt64($1) })
+        }
         m.start(queue: .global(qos: .utility))
         monitor = m
         #if canImport(UIKit)

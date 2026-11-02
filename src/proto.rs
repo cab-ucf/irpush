@@ -28,13 +28,13 @@ pub(crate) type Id = [u8; 16];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 #[repr(u8)]
-pub(crate) enum Kind { Push = 1, Ack, Hello, Pair, Intro, Revoke, Relays, Echo }
+pub(crate) enum Kind { Push = 1, Ack, Hello, Pair, Intro, Revoke, Relays, Echo, Route }
 
 impl TryFrom<u8> for Kind {
     type Error = anyhow::Error;
     fn try_from(b: u8) -> Result<Self> {
         use Kind::*;
-        Ok(match b { 1 => Push, 2 => Ack, 3 => Hello, 4 => Pair, 5 => Intro, 6 => Revoke, 7 => Relays, 8 => Echo, _ => anyhow::bail!("kind {b}") })
+        Ok(match b { 1 => Push, 2 => Ack, 3 => Hello, 4 => Pair, 5 => Intro, 6 => Revoke, 7 => Relays, 8 => Echo, 9 => Route, _ => anyhow::bail!("kind {b}") })
     }
 }
 
@@ -54,17 +54,17 @@ fn kdf(salt: &[u8], ikm: &[&[u8]], info: &[&[u8]]) -> [u8; 32] {
 
 pub(crate) fn pair_psk(s: &[u8; 32], a: EndpointId, b: EndpointId) -> [u8; 32] {
     let (a, b) = if a.as_bytes() < b.as_bytes() { (a, b) } else { (b, a) };
-    kdf(s, &[], &[b"irpush/4/psk", a.as_bytes(), b.as_bytes()])
+    kdf(s, &[], &[b"irpush/5/psk", a.as_bytes(), b.as_bytes()])
 }
 
 /// Introduction PSK for a and b, from the introducing host's secret (idempotent across retries).
 pub(crate) fn intro_psk(host_secret: &[u8; 32], a: EndpointId, b: EndpointId) -> [u8; 32] {
     let (a, b) = if a.as_bytes() < b.as_bytes() { (a, b) } else { (b, a) };
-    kdf(host_secret, &[], &[b"irpush/4/intro", a.as_bytes(), b.as_bytes()])
+    kdf(host_secret, &[], &[b"irpush/5/intro", a.as_bytes(), b.as_bytes()])
 }
 
 fn cipher(psk: &[u8; 32], ss: Option<&[u8]>, ct: &[u8], from: EndpointId, to: EndpointId) -> ChaCha20Poly1305 {
-    let (label, ikm): (&[u8], [&[u8]; 2]) = match ss { Some(ss) => (b"irpush/4/kem", [ss, ct]), None => (b"irpush/4/psk-frame", [&[], ct]) };
+    let (label, ikm): (&[u8], [&[u8]; 2]) = match ss { Some(ss) => (b"irpush/5/kem", [ss, ct]), None => (b"irpush/5/psk-frame", [&[], ct]) };
     ChaCha20Poly1305::new(&kdf(psk, &ikm, &[label, from.as_bytes(), to.as_bytes()]).into())
 }
 

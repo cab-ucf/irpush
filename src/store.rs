@@ -7,8 +7,8 @@ use iroh_base::{EndpointId, SecretKey};
 use std::{collections::HashMap, fs, io::Write, path::Path};
 use x_wing::{EncapsulationKey, kem::KeyExport};
 
-const VERSION: u8 = 7;
-const AAD: &[u8] = b"irpush/state/7";
+const VERSION: u8 = 8;
+const AAD: &[u8] = b"irpush/state/8";
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 #[repr(u8)]
@@ -20,7 +20,7 @@ pub(crate) struct Peer {
     pub psk: [u8; 32],
     pub role: Role,
     pub ts: u64,            // peer's key epoch (rejects rolled-back keys)
-    pub route: Vec<u8>,     // iOS: svc | topic len | topic | APNs token
+    pub route: Vec<u8>,     // iOS: APNs routes, one per app (apns::merge)
     pub relays: Vec<Relay>, // device: its app's default relays (hosts listen there)
 }
 

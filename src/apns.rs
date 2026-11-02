@@ -1,6 +1,6 @@
 //! Hosts post sealed frames straight to Apple (no gateway). Apple sees topic, device token, timing and
 //! a constant-size opaque blob; the phone's Notification Service Extension decrypts locally.
-use crate::proto::now;
+use crate::proto::{App, app, now};
 use anyhow::{Context, Result, ensure};
 use data_encoding::BASE64URL_NOPAD;
 
@@ -13,16 +13,40 @@ pub enum Svc { Apns = 0, ApnsSandbox = 1 }
 
 pub(crate) struct Route { pub sandbox: bool, pub topic: String, pub token: Vec<u8> }
 
+/// One device carries one route per app (several apps share the device):
+/// entry = app (16) | svc | topic len | topic | token len | token; a blob is entries concatenated.
 pub(crate) fn route(svc: Svc, topic: &str, token: &[u8]) -> Result<Vec<u8>> {
-    ensure!(!topic.is_empty() && topic.len() < 256 && !token.is_empty() && token.len() <= 255, "bad APNs route");
-    Ok([&[svc as u8, topic.len() as u8][..], topic.as_bytes(), token].concat())
+    ensure!(!topic.is_empty() && topic.len() < 256 && !token.is_empty() && token.len() < 256, "bad APNs route");
+    Ok([&app(topic)[..], &[svc as u8, topic.len() as u8], topic.as_bytes(), &[token.len() as u8], token].concat())
 }
 
-pub(crate) fn parse_route(b: &[u8]) -> Result<Route> {
-    let (&svc, rest) = b.split_first().context("route")?;
-    let (&n, rest) = rest.split_first().context("route")?;
-    let (topic, token) = rest.split_at_checked(n as usize).context("route")?;
-    Ok(Route { sandbox: svc == Svc::ApnsSandbox as u8, topic: String::from_utf8(topic.to_vec())?, token: token.to_vec() })
+fn entries(b: &[u8]) -> impl Iterator<Item = (App, &[u8])> {
+    let mut r = b;
+    std::iter::from_fn(move || {
+        let a: App = r.get(..16)?.try_into().ok()?;
+        let tl = *r.get(17)? as usize;
+        let n = 19 + tl + *r.get(18 + tl)? as usize;
+        let e = r.get(..n)?;
+        r = &r[n..];
+        Some((a, e))
+    })
+}
+
+/// Well formed: every byte belongs to an entry.
+pub(crate) fn valid(b: &[u8]) -> bool { entries(b).map(|e| e.1.len()).sum::<usize>() == b.len() }
+
+/// `blob` with `entry` replacing the entry for the same app (or added).
+pub(crate) fn merge(blob: &[u8], entry: &[u8]) -> Vec<u8> {
+    let a: App = entry[..16].try_into().expect("route entry");
+    entries(blob).filter(|e| e.0 != a).flat_map(|e| e.1.to_vec()).chain(entry.iter().copied()).collect()
+}
+
+pub(crate) fn remove(blob: &[u8], a: &App) -> Vec<u8> { entries(blob).filter(|e| e.0 != *a).flat_map(|e| e.1.to_vec()).collect() }
+
+pub(crate) fn parse_route(blob: &[u8], a: &App) -> Result<Route> {
+    let (_, e) = entries(blob).find(|e| e.0 == *a).context("no APNs route for this app")?;
+    let tl = e[17] as usize;
+    Ok(Route { sandbox: e[16] == Svc::ApnsSandbox as u8, topic: String::from_utf8(e[18..18 + tl].to_vec())?, token: e[19 + tl..].to_vec() })
 }
 
 /// Provider token: ES256 JWT {kid} {iss, iat}. Apple accepts it for 1 h; callers refresh every 40 min.
@@ -72,7 +96,13 @@ mod tests {
         let sig = Signature::from_slice(&BASE64URL_NOPAD.decode(s.as_bytes()).unwrap()).unwrap();
         VerifyingKey::from(&k).verify(m.as_bytes(), &sig).unwrap();
         assert!(jwt(&format!("A\"B TEAM\n{}", pem.as_str())).is_err());
-        let r = parse_route(&route(Svc::ApnsSandbox, "org.x.app", &[9; 32]).unwrap()).unwrap();
-        assert!(r.sandbox && r.topic == "org.x.app" && r.token == [9; 32]);
+        let (a, b) = (route(Svc::ApnsSandbox, "org.x.app", &[9; 32]).unwrap(), route(Svc::Apns, "org.x.other", &[1; 32]).unwrap());
+        let blob = merge(&merge(&a, &b), &route(Svc::ApnsSandbox, "org.x.app", &[7; 32]).unwrap()); // replaces, keeps order of others
+        assert!(valid(&blob) && !valid(&blob[..blob.len() - 1]));
+        let r = parse_route(&blob, &app("org.x.app")).unwrap();
+        assert!(r.sandbox && r.topic == "org.x.app" && r.token == [7; 32]);
+        assert_eq!(parse_route(&blob, &app("org.x.other")).unwrap().token, [1; 32]);
+        assert!(parse_route(&remove(&blob, &app("org.x.app")), &app("org.x.app")).is_err());
+        assert!(route(Svc::Apns, "", &[1]).is_err() && route(Svc::Apns, "x", &[]).is_err());
     }
 }

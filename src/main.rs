@@ -4,6 +4,7 @@ usage:
   irpush DIR create [RELAYS]       found a mesh as its first host; RELAYS = \"https://r.example#hextoken,...\"
   irpush DIR join TICKET [RELAYS]  join a mesh (RELAYS: an app's default relays, devices only)
   irpush DIR run [RELAYS]          run; prints \"sender app data\" (hex) per push; serves DIR/sock
+  irpush DIR attach APP [APP...]   stream the pushes for these apps from the running node (any user program)
   irpush DIR ticket [host]         one-time ticket, valid 10 min (treat as a secret)
   irpush DIR push DEVICE APP       send stdin (<= 1536 B) to APP (e.g. org.example.chat) on DEVICE
   irpush DIR relays RELAYS         set the mesh relays (also relay-token rotation)
@@ -15,10 +16,9 @@ usage:
 State key (KEK): $CREDENTIALS_DIRECTORY/irpush.kek (systemd-creds, TPM-bound), else DIR/kek.
 Logs: stderr, RUST_LOG (default irpush=info).";
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail, ensure};
 use irpush::{BODY, Node, Relay, Role, Svc, app, random32, write_private};
-use std::{fs, io::{Read, Write}, os::unix::{fs::{MetadataExt, PermissionsExt}, net::UnixStream}, path::Path, sync::Arc};
-use tokio::{io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader}, net::UnixListener};
+use std::{fs, io::Read, os::unix::fs::{MetadataExt, PermissionsExt}, path::Path, sync::Arc};
 
 fn kek(dir: &Path) -> Result<[u8; 32]> {
     let p = std::env::var_os("CREDENTIALS_DIRECTORY").map(|d| Path::new(&d).join("irpush.kek")).filter(|p| p.exists()).unwrap_or(dir.join("kek"));
@@ -28,14 +28,16 @@ fn kek(dir: &Path) -> Result<[u8; 32]> {
 
 /// Client side of DIR/sock: one command line (+ stdin body for push/apns), prints the answer.
 fn client(dir: &Path, cmd: &str, args: &[&str]) -> Result<()> {
-    let mut s = UnixStream::connect(dir.join("sock")).context("no running node (irpush DIR run)")?;
-    s.write_all(format!("{cmd} {}\n", args.join(" ")).as_bytes())?;
-    if cmd == "push" || cmd == "apns" { std::io::copy(&mut std::io::stdin().take(BODY as u64 + 1), &mut s)?; }
-    s.shutdown(std::net::Shutdown::Write)?;
-    let mut out = String::new();
-    s.read_to_string(&mut out)?;
-    if let Some(e) = out.strip_prefix("error: ") { bail!("{}", e.trim()) }
-    print!("{out}");
+    let sock = dir.join("sock").to_string_lossy().into_owned();
+    if cmd == "attach" {
+        ensure!(!args.is_empty(), "attach APP...");
+        let apps: Vec<_> = args.iter().map(|a| app(a)).collect();
+        irpush::local::attach(&sock, &apps, |from, app, d| println!("{from} {} {}", hex::encode(app), hex::encode(d)), || std::process::exit(1))?;
+        loop { std::thread::park() }
+    }
+    let mut body = vec![];
+    if cmd == "push" || cmd == "apns" { std::io::stdin().take(BODY as u64 + 1).read_to_end(&mut body)?; }
+    print!("{}", irpush::local::command(&sock, &format!("{cmd} {}", args.join(" ")), &body)?);
     Ok(())
 }
 
@@ -95,22 +97,9 @@ async fn main() -> Result<()> {
     };
     let (node, _lock) = (Arc::new(node.0), node.1);
     tracing::info!(id = %node.id(), role = ?node.role(), "started");
-    let sock = dir.join("sock");
-    let _ = fs::remove_file(&sock); // we hold DIR/lock: any socket here is stale
-    let (l, uid) = (UnixListener::bind(&sock)?, dir.metadata()?.uid()); // 0700 dir + peer uid check
-    let n = node.clone();
-    tokio::spawn(async move {
-        while let Ok((mut s, _)) = l.accept().await {
-            if s.peer_cred().map(|c| c.uid()).ok() != Some(uid) { continue }
-            let n = n.clone();
-            tokio::spawn(async move {
-                let mut r = BufReader::new(&mut s);
-                let (mut line, mut body) = (String::new(), vec![]);
-                if r.read_line(&mut line).await.is_err() || r.take(BODY as u64 + 1).read_to_end(&mut body).await.is_err() { return }
-                let out = command(&n, &line, body).unwrap_or_else(|e| format!("error: {e:#}\n"));
-                let _ = s.write_all(out.as_bytes()).await;
-            });
-        }
-    });
-    node.run(|from, app, d| println!("{from} {} {}", hex::encode(app), hex::encode(d))).await
+    // DIR/sock: commands and `attach` streams, own uid only (0700 dir + peer credential check).
+    let (l, uid) = (irpush::local::bind(&dir.join("sock").to_string_lossy())?, dir.metadata()?.uid());
+    let local = Arc::new(irpush::Local::default());
+    tokio::spawn(irpush::local::serve(node.clone(), local.clone(), l, move |u, _| u == Some(uid), command));
+    node.run(|from, app, d| if !local.deliver(from, app, d) { println!("{from} {} {}", hex::encode(app), hex::encode(d)) }).await
 }

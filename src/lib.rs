@@ -6,17 +6,22 @@
 //!   APNs directly for iOS. Desktops listen on every candidate relay; phones never probe.
 //! - Every frame is fixed-size and sealed end to end with X-Wing (ML-KEM-768 + X25519) + a pairwise
 //!   PSK. Relays and Apple see ids/tokens, IPs and timing; never content, app, kind or length.
+//! - One node per phone: the first app binds the local socket and runs it, later apps attach over it
+//!   (`local`). iOS cannot share a socket across apps; its apps share the identity (App Group) and
+//!   each has its own APNs route.
 //!
 //! Trust model: hosts are trusted infrastructure. Only hosts issue tickets, introduce, revoke and set
 //! mesh relays. A stolen device can be revoked and cannot add members.
 mod apns;
 #[cfg(feature = "ffi")]
 pub mod ffi;
+pub mod local;
 mod proto;
 mod relay;
 mod store;
 
 pub use apns::Svc;
+pub use local::Local;
 pub use proto::{App, BODY, FRAME, app};
 pub use relay::{N0, Relay, is_n0};
 pub use store::{Role, write_private};
@@ -80,10 +85,10 @@ impl State {
     fn hosts(&self) -> Vec<EndpointId> { self.d.peers.iter().filter(|p| p.1.role == Role::Host).map(|p| *p.0).collect() }
     fn relays_msg(&self) -> Vec<u8> { [&self.d.relays_ver.to_le_bytes()[..], &Relay::enc(&self.d.relays)].concat() }
 
-    /// key epoch | ek | tag(mesh relays) | APNs route | device: its app's relays (hosts listen there)
+    /// key epoch | ek | tag(mesh relays) | device: its app's relays (hosts listen there)
     fn hello(&self) -> Vec<u8> {
         let app = if self.d.role == Role::Device { Relay::enc(&self.d.app) } else { lp(&[]) };
-        [&self.d.rotated.to_le_bytes()[..], &self.ek(), &tag(&self.relays_msg()), &lp(&self.d.route), &app].concat()
+        [&self.d.rotated.to_le_bytes()[..], &self.ek(), &tag(&self.relays_msg()), &app].concat()
     }
 
     /// Device: preference order. Unpaired: only where the ticket's host listens.
@@ -164,7 +169,7 @@ impl Node {
     /// Join with a one-time ticket. Pairing completes (and is retried) once `run` reaches a relay.
     /// `app`: the app developer's default relays; used after the mesh's own.
     pub fn join(path: impl Into<PathBuf>, kek: [u8; 32], ticket: &str, app: Vec<Relay>) -> Result<Self> {
-        let (h, relays) = ticket.trim().strip_prefix("irpush4:").and_then(|t| t.split_once('@')).context("bad ticket")?;
+        let (h, relays) = ticket.trim().strip_prefix("irpush5:").and_then(|t| t.split_once('@')).context("bad ticket")?;
         let b = hex::decode(h)?;
         let mut r = Rd(&b);
         let (host, s, role) = (r.id()?, r.arr()?, Role::of(r.u8()?));
@@ -210,7 +215,7 @@ impl Node {
         let (id, mut st) = (rnd(), self.lock());
         let f = st.frame(to, Kind::Push, &id, app, data)?;
         self.out(&st, to, f);
-        if !st.d.peers[&to].route.is_empty() && !st.d.apns.is_empty() { let _ = self.atx.send((id, st.via.contains_key(&to))); }
+        if !st.d.apns.is_empty() && apns::parse_route(&st.d.peers[&to].route, app).is_ok() { let _ = self.atx.send((id, st.via.contains_key(&to))); }
         if st.pending.values().filter(|p| p.to == to).count() >= MAX_PENDING { // drop the oldest for this peer
             if let Some(old) = st.pending.iter().filter(|p| p.1.to == to).min_by_key(|p| p.1.exp).map(|p| *p.0) { st.pending.remove(&old); }
         }
@@ -218,14 +223,20 @@ impl Node {
         Ok(())
     }
 
-    /// iOS device: register or refresh the APNs device token (announced to hosts, sealed).
+    /// iOS device: register or refresh one app's APNs token (`topic` = its bundle id; several apps
+    /// share the device). Announced to hosts, sealed.
     pub fn set_route(&self, svc: Svc, topic: &str, token: &[u8]) -> Result<()> {
-        let r = apns::route(svc, topic, token)?;
+        let e = apns::route(svc, topic, token)?;
         let mut st = self.lock();
+        let r = apns::merge(&st.d.route, &e);
         if st.d.route == r { return Ok(()) }
         st.d.route = r;
         self.save(&st)?;
-        for h in st.hosts() { self.send(&st, h, Kind::Hello, &st.hello())?; }
+        self.send_routes(&st)
+    }
+
+    fn send_routes(&self, st: &State) -> Result<()> {
+        if !st.d.route.is_empty() { for h in st.hosts() { self.send(st, h, Kind::Route, &st.d.route)?; } }
         Ok(())
     }
 
@@ -246,7 +257,7 @@ impl Node {
         let (s, t) = (rnd(), Instant::now());
         st.secrets.retain(|x| x.exp > t);
         st.secrets.push(Secret { s, grant, exp: t + TICKET_TTL, used: None });
-        Ok(format!("irpush4:{}@{}", hex::encode([&st.id().as_bytes()[..], &s, &[grant as u8]].concat()), Relay::show(&st.d.relays)))
+        Ok(format!("irpush5:{}@{}", hex::encode([&st.id().as_bytes()[..], &s, &[grant as u8]].concat()), Relay::show(&st.d.relays)))
     }
 
     /// Remove a member everywhere (flooded host to host; accepted only from hosts).
@@ -348,6 +359,10 @@ impl Node {
                     }
                     Kind::Echo if st.d.role == Role::Host && m.data.len() == 4 => self.on_echo_request(&mut st, from, &mut r)?,
                     Kind::Echo if host => if m.data.is_empty() { st.echoed = true } else { st.echo_alive = true },
+                    Kind::Route if st.d.role == Role::Host && !host && apns::valid(m.data) => {
+                        let changed = st.d.peers.get_mut(&from).filter(|p| p.route != m.data).map(|p| p.route = m.data.to_vec()).is_some();
+                        if changed { self.save(&st)?; }
+                    }
                     k => debug!(?k, %from, "ignored"),
                 }
                 Ok(())
@@ -404,16 +419,15 @@ impl Node {
     /// A peer is online, maybe with a rotated key, new APNs token or new app relays.
     fn on_hello(&self, st: &mut State, from: EndpointId, r: &mut Rd) -> Result<()> {
         let (ts, ek, tg) = (r.u64()?, r.ek()?, r.arr::<8>()?);
-        let (route, relays) = (r.lp().map(|b| b.to_vec()).unwrap_or_default(), Relay::dec(r).unwrap_or_default());
+        let relays = Relay::dec(r).unwrap_or_default();
         let me_host = st.d.role == Role::Host;
         let p = st.d.peers.get_mut(&from).context("peer")?;
         let rekey = ts >= p.ts && ek != p.ek;
         let relays = if me_host && p.role == Role::Device { device_relays(relays) } else { p.relays.clone() };
         let relays_changed = relays != p.relays;
-        let dirty = rekey || p.route != route || relays_changed;
         if rekey { (p.ek, p.ts) = (ek, ts); }
-        (p.route, p.relays) = (route, relays);
-        if dirty { self.save(st)?; }
+        p.relays = relays;
+        if rekey || relays_changed { self.save(st)?; }
         if relays_changed { self.changed.notify_one(); }
         if rekey { self.send(st, from, Kind::Hello, &st.hello())?; } // answer with ours once
         if me_host && tg != tag(&st.relays_msg()) { self.send(st, from, Kind::Relays, &st.relays_msg())?; } // missed an update
@@ -460,8 +474,9 @@ impl Node {
         Ok(())
     }
 
-    /// Run forever; `on(sender, app, data)` fires once per push. Device: one relay connection.
-    /// Host: one listener per candidate relay, plus the APNs sender.
+    /// Run forever; `on(sender, app, data)` fires once per push (wrap it with [`Local::deliver`] when
+    /// serving other apps on this machine). Device: one relay connection. Host: one listener per
+    /// candidate relay, plus the APNs sender.
     pub async fn run(&self, on: impl Fn(EndpointId, App, &[u8])) -> Result<()> {
         let arx = self.arx.lock().unwrap_or_else(|e| e.into_inner()).take().context("run called twice")?;
         let tlsc = tls::CaTlsConfig::default().client_config(tls::default_provider())?; // shared: TLS resumption
@@ -539,6 +554,7 @@ impl Node {
             self.rotate(&mut st)?;
             self.pair_request(&st)?;
             for h in st.hosts() { self.send(&st, h, Kind::Hello, &st.hello())?; } // "I'm back": hosts flush queues
+            if st.d.role == Role::Device { self.send_routes(&st)?; }
             self.flush(&mut st, None);
             st.net
         };
@@ -626,20 +642,20 @@ impl Node {
         let token = Mutex::new((String::new(), 0u64)); // JWT, reused 40 min
         let one = |id: Id, wait: bool| { let (http, token) = (&http, &token); async move {
             if wait { sleep(Duration::from_secs(1)).await; }
-            let (to, route, f, auth) = {
+            let (to, app, route, f, auth) = {
                 let mut st = self.lock();
                 let Some(p) = st.pending.get(&id).filter(|p| !p.apns) else { return Ok(()) }; // acked meanwhile
                 let (to, app, data) = (p.to, p.app, p.data.clone());
-                let route = apns::parse_route(&st.d.peers.get(&to).context("peer")?.route)?;
+                let route = apns::parse_route(&st.d.peers.get(&to).context("peer")?.route, &app)?;
                 let f = BASE64.encode(&st.frame(to, Kind::Push, &id, &app, &data)?);
                 let mut t = token.lock().unwrap_or_else(|e| e.into_inner());
                 if now() > t.1 + 2400 { *t = (apns::jwt(std::str::from_utf8(&st.d.apns)?)?, now()); }
                 if let Some(p) = st.pending.get_mut(&id) { p.apns = true; }
-                (to, route, f, t.0.clone())
+                (to, app, route, f, t.0.clone())
             };
             if let apns::Sent::Gone = apns::post(http, &route, &auth, &f).await? { // token dead: stop using it
                 let mut st = self.lock();
-                if let Some(p) = st.d.peers.get_mut(&to) { p.route.clear(); }
+                if let Some(p) = st.d.peers.get_mut(&to) { p.route = apns::remove(&p.route, &app); }
                 self.save(&st)?;
             }
             anyhow::Ok(())

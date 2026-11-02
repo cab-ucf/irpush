@@ -34,11 +34,22 @@ infrastructure; one optional VPS improves Android battery and privacy.
   show a notice. Heartbeats are learned per network by testing the *inbound* path (a host
   echoes after the candidate silence), so NATs and VPNs that silently drop inbound traffic
   (e.g. WireGuard without PersistentKeepalive) are detected rather than assumed alive.
-- **iOS**: in the background the app's socket is closed; hosts post the same sealed frame to APNs and
-  the app's Notification Service Extension decrypts it *on the phone*.
+- **One node per phone**: the first irpush app binds the local socket (`@irpush`, a Linux abstract
+  socket on Android; `DIR/sock` on desktops) and runs the node; every later app connects and
+  `attach`es its app ids, receiving their pushes over that socket. The kernel's bind is the election:
+  when the owner dies, the next app whose connect fails binds and takes over. Pushes for apps that
+  are not attached reach the owner's platform callback, which wakes them. The owner authenticates
+  attaching processes by uid (Android: uid -> package names -> `irp_app(package)`). The owner process
+  decrypts every frame, so the apps of one phone trust each other as they trust the OS.
+- **iOS**: Apple forbids sockets across apps, so apps of one team share the identity through the App
+  Group (one device id, one APNs route per app, sent as `Route` frames) and each foreground app holds
+  the socket while it runs. In the background the socket is closed; hosts post the same sealed frame
+  to APNs and the app's Notification Service Extension decrypts it *on the phone*.
 - **Frames**: 2715 B, always. X-Wing (ML-KEM-768 + X25519) per frame to the recipient's key, plus a
   pairwise PSK, bound to sender, recipient and direction; ChaCha20-Poly1305. Timestamped (25 h
   window) and de-duplicated by id. State at rest: one XChaCha20-Poly1305 file under a platform key.
+- **Relay hop**: TLS 1.3 with X25519MLKEM768 key exchange (rustls, aws-lc-rs provider), so the
+  metadata the relay hop carries (endpoint ids, tokens) is not harvest-now-decrypt-later exposed either.
 
 ## Threat model
 | Party | Sees | Cannot |
@@ -64,10 +75,22 @@ relay can link a device's sessions over time. Device-suggested relays must be `h
     irpush NEWDIR join TICKET                                # on the new node, then `run`
     echo hi | irpush ~/.irpush push DEVICE_ID org.example.chat   # <= 1536 B
     irpush ~/.irpush id | peers | revoke ID
+    irpush ~/.irpush attach org.example.chat org.example.mail   # stream these apps' pushes (any program)
     irpush ~/.irpush relays "https://a.example#TOKEN,https://b.example"   # later changes
 
 Library: `Node::{create, join, open}`, `run(callback)`, `push`, `ticket`, `revoke`, `set_relays`,
-`set_route` / `set_apns_key` (iOS), `network` / `kick` / `pause` (platform hooks). C ABI: `src/ffi.rs`.
+`set_route` / `set_apns_key` (iOS), `network` / `kick` / `pause` (platform hooks); `local::{bind,
+serve, attach}` and `Local::deliver` for the shared node. C ABI: `src/ffi.rs` (`irp_serve` / `irp_attach`).
+
+## Android (Kotlin shell, to be written against the C ABI)
+On start: `irp_attach("@irpush", apps, cb)`; on -1, `irp_open`/`irp_join` then `irp_serve("@irpush",
+auth)`, where `auth(uid, app)` checks `irp_app(pkg) == app` for every package of that uid
+(`PackageManager.getPackagesForUid`). The owner runs as a foreground service (`dataSync`); for a
+push nobody attached, `cb` sends an explicit broadcast to the package registered for that app id. Hooks:
+`irp_network(sha256(interface name))` from `ConnectivityManager`, `irp_kick` from
+`AlarmManager.setExactAndAllowWhileIdle`. When an attached app gets `cb(from == NULL)` the owner is
+gone: attach again, else become the owner (the state file stays with the first owner's app; if that app
+is uninstalled the phone re-pairs with one ticket).
 
 ## iOS
 Host, once: `irpush ~/.irpush apns KEYID TEAMID < AuthKey_KEYID.p8` (one key covers your apps).
@@ -100,9 +123,10 @@ counts as a heartbeat; relay preference re-checked only on wakeups that happen a
 backed off (5 min .. 6 h). On n0 (zero infrastructure) its 15 s server pings cost Android battery.
 
 ## Tests
-`cargo test`: frame crypto (binding, tamper, freshness), state round trip, relay parsing, APNs JWT,
-and an end-to-end mesh over an in-process relay (late-host pairing, introductions, two hosts,
-offline queue, revocation, identity and key guards).
+`cargo test`: frame crypto (binding, tamper, freshness), state round trip, relay parsing, APNs JWT and
+per-app routes, an end-to-end mesh over an in-process relay (late-host pairing, introductions, two
+hosts, offline queue, revocation, identity and key guards), and the shared node (attach, device id,
+fall-through to the owner, refused attach, single owner).
 
 ## Limits
 Host queues live in memory (a host restart drops unacknowledged pushes). The protocol has not been
