@@ -34,7 +34,10 @@ impl Local {
 fn std_bind(p: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some(name) = p.strip_prefix('@') {
+        #[cfg(target_os = "linux")]
         use std::os::linux::net::SocketAddrExt;
+        #[cfg(target_os = "android")]
+        use std::os::android::net::SocketAddrExt;
         return std::os::unix::net::UnixListener::bind_addr(&std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?);
     }
     let _ = std::fs::remove_file(p); // the caller holds the owner lock: any socket here is stale
@@ -44,7 +47,10 @@ fn std_bind(p: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
 fn std_connect(p: &str) -> std::io::Result<std::os::unix::net::UnixStream> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some(name) = p.strip_prefix('@') {
+        #[cfg(target_os = "linux")]
         use std::os::linux::net::SocketAddrExt;
+        #[cfg(target_os = "android")]
+        use std::os::android::net::SocketAddrExt;
         return std::os::unix::net::UnixStream::connect_addr(&std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?);
     }
     std::os::unix::net::UnixStream::connect(p)
