@@ -136,8 +136,9 @@ On DigitalOcean (the smallest droplet that installs is 2 GB; Hetzner works too):
 1. Create an Ubuntu droplet with an SSH key used only for it. Add an A record `irpush.<you>` -> its IP.
 2. In `deploy/config.nix`, set your domain, email and that SSH public key.
 3. `make deploy HOST=<ip>`: nixos-anywhere replaces Ubuntu with NixOS, built on the droplet.
-4. `make token HOST=<ip>`: prints the token. Use `https://irpush.<you>#TOKEN` as your app's relay,
-   `irpush DIR relays ...` for a mesh, or `services.irch.pushRelay` on an irch storage node.
+4. `make token HOST=<ip>`: prints the token. Use `https://irpush.<you>#TOKEN` as your app's relay or
+   `irpush DIR relays ...` for a mesh. An irch storage node reads it from a root-only file outside
+   the Nix store (`services.irch.pushRelayFile`, e.g. via agenix or sops-nix).
 
 Later: `make update HOST=<ip>` applies changes; `make bump` moves the pinned nixpkgs and disko first.
 Rotate after a revoke: `make token-add`, `irpush DIR relays "https://irpush.<you>#NEW"`, then after a
