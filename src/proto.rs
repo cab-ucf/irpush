@@ -28,17 +28,17 @@ pub(crate) type Id = [u8; 16];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 #[repr(u8)]
-pub(crate) enum Kind { Push = 1, Ack, Hello, Pair, Intro, Revoke, Relays, Echo, Route }
+pub(crate) enum Kind { Push = 1, Ack, Hello, Pair, Intro, Revoke, Relays, Echo, Route, Key }
 
 impl TryFrom<u8> for Kind {
     type Error = anyhow::Error;
     fn try_from(b: u8) -> Result<Self> {
         use Kind::*;
-        Ok(match b { 1 => Push, 2 => Ack, 3 => Hello, 4 => Pair, 5 => Intro, 6 => Revoke, 7 => Relays, 8 => Echo, 9 => Route, _ => anyhow::bail!("kind {b}") })
+        Ok(match b { 1 => Push, 2 => Ack, 3 => Hello, 4 => Pair, 5 => Intro, 6 => Revoke, 7 => Relays, 8 => Echo, 9 => Route, 10 => Key, _ => anyhow::bail!("kind {b}") })
     }
 }
 
-pub(crate) struct Msg<'a> { pub kind: Kind, pub id: Id, pub app: App, pub data: &'a [u8] }
+pub(crate) struct Msg<'a> { pub kind: Kind, pub id: Id, pub app: App, pub ts: u64, pub data: &'a [u8] }
 
 pub(crate) fn rnd<const N: usize>() -> [u8; N] { let mut b = [0; N]; getrandom::fill(&mut b).expect("OS RNG"); b }
 pub(crate) fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) }
@@ -63,6 +63,13 @@ pub(crate) fn intro_psk(host_secret: &[u8; 32], a: EndpointId, b: EndpointId) ->
     kdf(host_secret, &[], &[b"irpush/5/intro", a.as_bytes(), b.as_bytes()])
 }
 
+/// The pair's own PSK: the old one (which a ticket holder or introducing host may know) mixed with
+/// one secret from each side, each sent KEM-sealed to the other, so no third party learns it.
+pub(crate) fn mix_psk(psk: &[u8; 32], (a, ca): (EndpointId, &[u8; 32]), (b, cb): (EndpointId, &[u8; 32])) -> [u8; 32] {
+    let ((a, ca), (b, cb)) = if a.as_bytes() < b.as_bytes() { ((a, ca), (b, cb)) } else { ((b, cb), (a, ca)) };
+    kdf(psk, &[ca, cb], &[b"irpush/5/mix", a.as_bytes(), b.as_bytes()])
+}
+
 fn cipher(psk: &[u8; 32], ss: Option<&[u8]>, ct: &[u8], from: EndpointId, to: EndpointId) -> ChaCha20Poly1305 {
     let (label, ikm): (&[u8], [&[u8]; 2]) = match ss { Some(ss) => (b"irpush/5/kem", [ss, ct]), None => (b"irpush/5/psk-frame", [&[], ct]) };
     ChaCha20Poly1305::new(&kdf(psk, &ikm, &[label, from.as_bytes(), to.as_bytes()]).into())
@@ -83,7 +90,7 @@ pub(crate) fn parse(p: &[u8]) -> Result<Msg<'_>> {
     let t = now();
     ensure!(ts + MAX_AGE >= t && ts <= t + MAX_SKEW, "stale or future frame");
     let n = u16::from_le_bytes([p[41], p[42]]) as usize;
-    Ok(Msg { kind: p[0].try_into()?, id: p[1..17].try_into()?, app: p[17..33].try_into()?, data: p.get(HDR..HDR + n).context("len")? })
+    Ok(Msg { kind: p[0].try_into()?, id: p[1..17].try_into()?, app: p[17..33].try_into()?, ts, data: p.get(HDR..HDR + n).context("len")? })
 }
 
 /// `ek`: Some = KEM mode to the recipient's key, None = PSK mode.

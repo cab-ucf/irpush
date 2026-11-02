@@ -6,7 +6,8 @@
 typedef void (*irp_status_cb)(void *ctx, const char *url, bool fallback);
 int32_t irp_status(irp_status_cb cb, void *ctx);
 typedef void (*irp_cb)(void *ctx, const uint8_t *from, const uint8_t *app, const uint8_t *data, size_t len);
-/* relays: app's default push relays "url#hextoken,url" in preference order, or NULL. */
+/* relays: app's default push relays "url#hextoken,url" in preference order, or NULL.
+   join/open: -4 = another process runs this node (attach instead). */
 int32_t irp_join(const char *path, const uint8_t *kek, const char *ticket, const char *relays, irp_cb cb, void *ctx);
 int32_t irp_open(const char *path, const uint8_t *kek, const char *relays, irp_cb cb, void *ctx);
 int32_t irp_route(bool sandbox, const char *topic, const uint8_t *token, size_t len);
@@ -23,5 +24,5 @@ void irp_network(uint64_t id);
 uint32_t irp_kick(void);
 int32_t irp_id(uint8_t *out);
 int32_t irp_app(const char *name, uint8_t *out);
-/* Notification Service Extension: payload length, -1 not ours/duplicate, -2 error. */
+/* Notification Service Extension: payload length, -1 not ours/duplicate, -2 error or cap < 1536. */
 intptr_t irp_notification(const char *path, const uint8_t *kek, const char *f, uint8_t *from, uint8_t *app, uint8_t *out, size_t cap);

@@ -32,8 +32,11 @@ fn entries(b: &[u8]) -> impl Iterator<Item = (App, &[u8])> {
     })
 }
 
-/// Well formed: every byte belongs to an entry.
-pub(crate) fn valid(b: &[u8]) -> bool { entries(b).map(|e| e.1.len()).sum::<usize>() == b.len() }
+/// Well formed: every byte belongs to an entry, each addressed to the app its topic names.
+pub(crate) fn valid(b: &[u8]) -> bool {
+    let ok = |(a, e): &(App, &[u8])| e[16] <= Svc::ApnsSandbox as u8 && std::str::from_utf8(&e[18..18 + e[17] as usize]).is_ok_and(|t| app(t) == *a);
+    entries(b).try_fold(0, |n, e| ok(&e).then_some(n + e.1.len())) == Some(b.len())
+}
 
 /// `blob` with `entry` replacing the entry for the same app (or added).
 pub(crate) fn merge(blob: &[u8], entry: &[u8]) -> Vec<u8> {
@@ -62,7 +65,7 @@ pub(crate) fn jwt(creds: &str) -> Result<String> {
     Ok(format!("{m}.{}", BASE64URL_NOPAD.encode(&sig.to_bytes())))
 }
 
-pub(crate) enum Sent { Ok, Gone }
+pub(crate) enum Sent { Ok, Gone, Retry(String) }
 
 pub(crate) async fn post(http: &reqwest::Client, r: &Route, auth: &str, frame_b64: &str) -> Result<Sent> {
     #[cfg(debug_assertions)] // tests point this at a mock; release builds always talk to Apple
@@ -74,11 +77,16 @@ pub(crate) async fn post(http: &reqwest::Client, r: &Route, auth: &str, frame_b6
         .bearer_auth(auth).header("apns-topic", &r.topic).header("apns-push-type", "alert")
         .header("apns-priority", "10").header("apns-expiration", (now() + 86400).to_string())
         .body(format!(r#"{{"aps":{{"alert":{{"body":"{ALERT}"}},"mutable-content":1}},"f":"{frame_b64}"}}"#))
-        .send().await?;
-    match res.status().as_u16() {
+        .send().await;
+    let res = match res { Ok(r) => r, Err(e) => return Ok(Sent::Retry(e.to_string())) };
+    let s = res.status().as_u16();
+    let why = res.text().await.unwrap_or_default();
+    match s {
         200 => Ok(Sent::Ok),
         410 => Ok(Sent::Gone), // token unregistered: stop using it
-        s => anyhow::bail!("apns {s}: {}", res.text().await.unwrap_or_default()),
+        400 if why.contains("BadDeviceToken") || why.contains("DeviceTokenNotForTopic") => Ok(Sent::Gone),
+        429 | 500.. => Ok(Sent::Retry(format!("apns {s}: {why}"))),
+        _ => anyhow::bail!("apns {s}: {why}"),
     }
 }
 
@@ -99,6 +107,9 @@ mod tests {
         let (a, b) = (route(Svc::ApnsSandbox, "org.x.app", &[9; 32]).unwrap(), route(Svc::Apns, "org.x.other", &[1; 32]).unwrap());
         let blob = merge(&merge(&a, &b), &route(Svc::ApnsSandbox, "org.x.app", &[7; 32]).unwrap()); // replaces, keeps order of others
         assert!(valid(&blob) && !valid(&blob[..blob.len() - 1]));
+        let mut forged = a.clone();
+        forged[..16].copy_from_slice(&app("org.x.other"));
+        assert!(!valid(&forged), "an entry's app must be its topic's");
         let r = parse_route(&blob, &app("org.x.app")).unwrap();
         assert!(r.sandbox && r.topic == "org.x.app" && r.token == [7; 32]);
         assert_eq!(parse_route(&blob, &app("org.x.other")).unwrap().token, [1; 32]);
