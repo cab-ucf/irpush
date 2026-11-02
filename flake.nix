@@ -28,7 +28,7 @@
         default = self.packages.${system}.irpush;
         irpush = pkgs.rustPlatform.buildRustPackage {
           pname = "irpush";
-          version = "0.1.0";
+          version = "0.1.6";
           src = fs.toSource { root = ./.; fileset = fs.unions [ ./Cargo.toml ./Cargo.lock ./src ]; };
           cargoLock.lockFile = ./Cargo.lock;
           doCheck = false;
