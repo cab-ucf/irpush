@@ -1,8 +1,9 @@
-//! JNI for the Android library (`android/`, class `org.irpush.Native`): the
-//! node of the app that owns this phone's irpush connection. Pushes are pulled
-//! by `next` on a Kotlin thread, so Rust never calls into the JVM.
+//! JNI for the Android library (`android/`, class `org.irpush.Native`), linked
+//! into the app's own native library (feature `jni`): the node of the app that
+//! owns this phone's irpush connection. Pushes are pulled by `next` on a Kotlin
+//! thread, so Rust never calls into the JVM.
 use crate::{Node, OFFLINE, app};
-use jni::{JNIEnv, objects::{JByteArray, JClass, JString}, sys::{jbyteArray, jlong, jstring}};
+use jni::{JNIEnv, objects::{JByteArray, JClass, JString}, sys::{jboolean, jbyteArray, jlong, jstring}};
 use std::{collections::VecDeque, path::Path, sync::{Arc, Condvar, Mutex, OnceLock}};
 
 static NODE: OnceLock<Arc<Node>> = OnceLock::new();
@@ -24,17 +25,26 @@ fn run(n: Node) -> Arc<Node> {
     n
 }
 
-/// Open the node at `path`, or join with `ticket` when there is none yet.
-/// Returns the device id (hex), null when not joined.
+/// Open the node at `path`, or join with `ticket` when there is none yet; a
+/// running node joins `ticket`'s mesh too. Returns the device id (hex), null
+/// when not joined.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_irpush_Native_start(mut e: JNIEnv, _: JClass, path: JString, kek: JByteArray, ticket: JString) -> jstring {
-    let id = NODE.get().cloned().or_else(|| {
-        let (p, t) = (s(&mut e, &path)?, s(&mut e, &ticket));
+    let t = s(&mut e, &ticket);
+    let id = NODE.get().cloned().inspect(|n| if let Some(t) = &t { let _ = n.add(t).map_err(|x| tracing::warn!("irpush: {x:#}")); }).or_else(|| {
+        let p = s(&mut e, &path)?;
         let k: [u8; 32] = e.convert_byte_array(&kek).ok()?.try_into().ok()?;
         let n = if Path::new(&p).exists() { Node::open(&p, k, vec![]) } else { Node::join(&p, k, &t?, vec![]) };
         n.map_err(|x| tracing::warn!("irpush: {x:#}")).ok().map(run)
     });
     id.and_then(|n| e.new_string(n.id().to_string()).ok()).map_or(std::ptr::null_mut(), |j| j.into_raw())
+}
+
+/// Whether the node has `host` (hex) as a peer: a join with its ticket is done.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_irpush_Native_has(mut e: JNIEnv, _: JClass, host: JString) -> jboolean {
+    let h = s(&mut e, &host).and_then(|h| h.parse().ok());
+    (NODE.get().zip(h).is_some_and(|(n, h)| n.has(&h))) as jboolean
 }
 
 /// Block until a push arrives: 32-byte sender, 16-byte app, payload.
