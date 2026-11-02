@@ -63,7 +63,7 @@ pub const OFFLINE: u64 = u64::MAX;
 type Tx = mpsc::UnboundedSender<(EndpointId, Vec<u8>)>;
 
 struct Secret { s: [u8; 32], grant: Role, exp: Instant, used: Option<EndpointId> } // issued by this host
-struct Join { host: EndpointId, s: [u8; 32], exp: Instant }                         // ticket being redeemed
+struct Join { host: EndpointId, s: [u8; 32], exp: Instant, relays: Vec<Relay> }     // ticket being redeemed
 impl Drop for Secret { fn drop(&mut self) { zeroize::Zeroize::zeroize(&mut self.s) } }
 impl Drop for Join { fn drop(&mut self) { zeroize::Zeroize::zeroize(&mut self.s) } }
 struct Pend { to: EndpointId, app: App, data: Vec<u8>, exp: Instant, apns: bool }  // re-sealed per send
@@ -75,6 +75,7 @@ struct State {
     dk: [DecapsulationKey; 2], // current, previous
     secrets: Vec<Secret>,
     join: Option<Join>,
+    home: bool, // joined another mesh on its relay: back to ours at the next pairing tick
     pending: HashMap<Id, Pend>,
     nack: HashMap<EndpointId, Instant>,       // rate limit for key-resync Hellos
     seen: HashSet<Id>,                        // control frame ids, until they leave the freshness window
@@ -92,7 +93,7 @@ struct State {
 impl State {
     fn new(d: Disk) -> Self {
         let dk = [DecapsulationKey::from(d.xw), DecapsulationKey::from(d.xw_prev)];
-        Self { d, dk, secrets: vec![], join: None, pending: HashMap::new(), nack: HashMap::new(), seen: HashSet::new(), seen_q: VecDeque::new(), rate: HashMap::new(), echo_until: HashMap::new(), via: HashMap::new(), down: HashMap::new(), net: 0, probe: 0, echoed: false, echo_alive: false }
+        Self { d, dk, secrets: vec![], join: None, home: false, pending: HashMap::new(), nack: HashMap::new(), seen: HashSet::new(), seen_q: VecDeque::new(), rate: HashMap::new(), echo_until: HashMap::new(), via: HashMap::new(), down: HashMap::new(), net: 0, probe: 0, echoed: false, echo_alive: false }
     }
     fn id(&self) -> EndpointId { self.d.sk.public() }
     fn hb(&self, net: u64) -> Duration {
@@ -105,14 +106,19 @@ impl State {
 
     /// key epoch | ek | tag(mesh relays) | device: its app's relays (hosts listen there)
     fn hello(&self) -> Vec<u8> {
-        let app = if self.d.role == Role::Device { Relay::enc(&self.d.app) } else { lp(&[]) };
+        let app = if self.d.role == Role::Device { Relay::enc(&self.uses()) } else { lp(&[]) };
         [&self.d.rotated.to_le_bytes()[..], &self.ek(), &tag(&self.relays_msg()), &app].concat()
     }
 
-    /// Device: preference order. Unpaired: only where the ticket's host listens.
+    /// Device: the relays it may be on, announced so every mesh's hosts listen there.
+    fn uses(&self) -> Vec<Relay> { relay::dedup(self.d.relays.iter().chain(&self.d.app).cloned()) }
+
+    /// Device: preference order. Unpaired: only where the ticket's host listens; joining another
+    /// mesh: there first, until its host answers.
     fn candidates(&self) -> Vec<Relay> {
         let app = self.d.app.iter().filter(|_| !self.hosts().is_empty()).cloned();
-        let all = relay::dedup(self.d.relays.iter().cloned().chain(app).chain(relay::fallback(&self.d.relays))); // n0: the last resort
+        let join = self.join.iter().flat_map(|j| j.relays.iter().cloned());
+        let all = relay::dedup(join.chain(self.d.relays.iter().cloned()).chain(app).chain(relay::fallback(&self.d.relays))); // n0: the last resort
         let t = Instant::now();
         let up: Vec<_> = all.iter().filter(|r| self.down.get(&r.url).is_none_or(|d| d.0 <= t)).cloned().collect();
         if up.is_empty() { all } else { up }
@@ -199,17 +205,32 @@ impl Node {
     /// Join with a one-time ticket. Pairing completes (and is retried) once `run` reaches a relay.
     /// `app`: the app developer's default relays; used after the mesh's own.
     pub fn join(path: impl Into<PathBuf>, kek: [u8; 32], ticket: &str, app: Vec<Relay>) -> Result<Self> {
-        let (h, relays) = ticket.trim().strip_prefix("irpush5:").and_then(|t| t.split_once('@')).context("bad ticket")?;
-        let b = hex::decode(h)?;
-        let mut r = Rd(&b);
-        let (host, s, role) = (r.id()?, r.arr()?, Role::of(r.u8()?));
-        ensure!(r.0.is_empty(), "bad ticket");
+        let (j, role) = parse_ticket(ticket)?;
         let path = path.into();
         ensure!(!path.exists(), "{} exists: refusing to replace an identity", path.display());
-        let n = Self::boot(path, kek, Disk::new(role, Relay::list(relays)?, app))?;
-        n.lock().join = Some(Join { host, s, exp: Instant::now() + TICKET_TTL });
+        let mut d = Disk::new(role, j.relays.clone(), app);
+        d.home = *j.host.as_bytes();
+        let n = Self::boot(path, kek, d)?;
+        n.lock().join = Some(j);
         Ok(n)
     }
+
+    /// Device: also join another mesh (another host's device ticket), so one device per phone
+    /// serves apps whose hosts differ. Its hosts can revoke only their own mesh's peers, and only
+    /// the first mesh sets our relays. A host of a mesh already joined: nothing to do.
+    pub fn add(&self, ticket: &str) -> Result<()> {
+        let (j, role) = parse_ticket(ticket)?;
+        let mut st = self.lock();
+        ensure!(st.d.role == Role::Device && role == Role::Device, "only devices join more meshes");
+        if st.d.peers.contains_key(&j.host) { return Ok(()) }
+        st.join = Some(j);
+        drop(st);
+        self.reset.notify_waiters(); // reconnect where the ticket's host listens
+        Ok(())
+    }
+
+    /// Whether `id` is our peer (e.g. a ticket's host, once joined).
+    pub fn has(&self, id: &EndpointId) -> bool { self.lock().d.peers.contains_key(id) }
 
     /// Every later start. Devices pass their app's current default relays (updates may change them).
     pub fn open(path: impl Into<PathBuf>, kek: [u8; 32], app: Vec<Relay>) -> Result<Self> {
@@ -406,13 +427,21 @@ impl Node {
                         let (id, role, ek, psk) = (r.id()?, Role::of(r.u8()?), r.ek()?, r.arr()?);
                         let met = role == Role::Host || st.d.role == Role::Host; // devices never take devices
                         if met && id != st.id() && !st.d.revoked.contains(&id) && !st.d.peers.contains_key(&id) {
-                            st.d.peers.insert(id, Peer { ek, psk, role, ts: 0, route: vec![], relays: vec![], mix: Mix::None });
+                            let mesh = st.d.peers.get(&from).map_or([0; 32], |p| p.mesh);
+                            st.d.peers.insert(id, Peer { ek, psk, role, ts: 0, route: vec![], relays: vec![], mix: Mix::None, mesh });
                             self.save(&st)?;
                             self.send(&st, id, Kind::Hello, &st.hello())?;
                         }
                     }
-                    Kind::Revoke if host => { let id = r.id()?; drop(st); self.apply_revoke(id)?; }
-                    Kind::Relays if host => {
+                    Kind::Revoke if host => {
+                        let id = r.id()?;
+                        // A device takes a revoke only for a peer of the revoking host's own mesh.
+                        let mesh = |i| st.d.peers.get(i).map(|p: &Peer| p.mesh);
+                        if st.d.role == Role::Device && (mesh(&id).is_none() || mesh(&id) != mesh(&from)) { return Ok(()) }
+                        drop(st);
+                        self.apply_revoke(id)?;
+                    }
+                    Kind::Relays if host && (st.d.role == Role::Host || st.d.peers.get(&from).is_some_and(|p| p.mesh == st.d.home)) => {
                         let (ver, l) = (r.u64()?, Relay::dec(&mut r)?);
                         if ver > st.d.relays_ver { (st.d.relays, st.d.relays_ver) = (l, ver); self.save(&st)?; self.changed.notify_one(); }
                     }
@@ -440,7 +469,7 @@ impl Node {
             let ek = r.ek()?;
             let relays = if grant == Role::Device { device_relays(Relay::dec(&mut r).unwrap_or_default()) } else { vec![] };
             st.secrets[i].used = Some(from);
-            st.d.peers.insert(from, Peer { ek, psk: proto::pair_psk(&s, st.id(), from), role: grant, ts: 0, route: vec![], relays, mix: Mix::None });
+            st.d.peers.insert(from, Peer { ek, psk: proto::pair_psk(&s, st.id(), from), role: grant, ts: 0, route: vec![], relays, mix: Mix::None, mesh: [0; 32] });
             self.save(st)?;
             self.changed.notify_one();
             info!(%from, ?grant, "paired");
@@ -458,7 +487,7 @@ impl Node {
     /// Joiner: (re)send the pairing request, sealed with the ticket secret.
     fn pair_request(&self, st: &State) -> Result<()> {
         let Some(j) = st.join.as_ref().filter(|j| j.exp > Instant::now()) else { return Ok(()) };
-        let pt = proto::plain(Kind::Pair, &rnd(), &[0; 16], &[st.ek(), Relay::enc(&st.d.app)].concat())?;
+        let pt = proto::plain(Kind::Pair, &rnd(), &[0; 16], &[st.ek(), Relay::enc(&st.uses())].concat())?;
         self.out(st, j.host, proto::seal(&j.s, None, st.id(), j.host, &pt));
         Ok(())
     }
@@ -467,12 +496,14 @@ impl Node {
     fn on_pair_reply(&self, st: &mut State, from: EndpointId, pt: &[u8]) -> Result<()> {
         let m = proto::parse(pt)?;
         ensure!(m.kind == Kind::Pair, "expected pair");
+        let more = !st.hosts().is_empty(); // another mesh: back to our own relays after
         let s = st.join.take().context("no join")?.s;
         let mut r = Rd(m.data);
         let (role, ek) = (Role::of(r.u8()?), r.ek()?);
-        st.d.peers.insert(from, Peer { ek, psk: proto::pair_psk(&s, st.id(), from), role, ts: 0, route: vec![], relays: vec![], mix: Mix::None });
+        st.d.peers.insert(from, Peer { ek, psk: proto::pair_psk(&s, st.id(), from), role, ts: 0, route: vec![], relays: vec![], mix: Mix::None, mesh: *from.as_bytes() });
         self.save(st)?;
         if role == Role::Host { self.send(st, from, Kind::Hello, &st.hello())?; }
+        st.home = more;
         info!(%from, "joined");
         Ok(())
     }
@@ -722,9 +753,10 @@ impl Node {
                     c.send(Out::Ping(d)).await?;
                     (ping, due) = (Some(d), Instant::now() + Duration::from_secs(15));
                 }
-                _ = sleep_until(retry), if self.lock().join.is_some() => {
+                _ = sleep_until(retry), if self.lock().join.is_some() || self.lock().home => {
                     let st = self.lock();
-                    if st.join.as_ref().is_some_and(|j| j.exp <= Instant::now()) { bail!("ticket expired before the host answered") }
+                    if st.join.is_none() { drop(st); self.lock().home = false; bail!("back to our own relays") } // another mesh joined: its introductions are in
+                    if st.join.as_ref().is_some_and(|j| j.exp <= Instant::now()) { drop(st); self.lock().join = None; bail!("ticket expired before the host answered") }
                     self.pair_request(&st)?;
                     retry = Instant::now() + Duration::from_secs(5);
                 }
@@ -782,6 +814,15 @@ impl Node {
 fn pq() -> std::sync::Arc<rustls::crypto::CryptoProvider> { rustls::crypto::aws_lc_rs::default_provider().into() }
 
 /// Relays a device may make hosts dial: public https names only, a few per device.
+fn parse_ticket(t: &str) -> Result<(Join, Role)> {
+    let (h, relays) = t.trim().strip_prefix("irpush5:").and_then(|t| t.split_once('@')).context("bad ticket")?;
+    let b = hex::decode(h)?;
+    let mut r = Rd(&b);
+    let (host, s, role) = (r.id()?, r.arr()?, Role::of(r.u8()?));
+    ensure!(r.0.is_empty(), "bad ticket");
+    Ok((Join { host, s, exp: Instant::now() + TICKET_TTL, relays: Relay::list(relays)? }, role))
+}
+
 fn device_relays(l: Vec<Relay>) -> Vec<Relay> {
     l.into_iter().filter(|r| r.public().is_ok()).take(MAX_DEVICE_RELAYS).collect()
 }
@@ -806,7 +847,7 @@ mod tests {
         assert!(State::new(own).candidates().iter().all(|r| r.url != N0));
     }
 
-    fn peer(role: Role, ek: x_wing::EncapsulationKey, psk: [u8; 32], relays: &str) -> Peer { Peer { ek, psk, role, ts: 0, route: vec![], relays: Relay::list(relays).unwrap(), mix: Mix::None } }
+    fn peer(role: Role, ek: x_wing::EncapsulationKey, psk: [u8; 32], relays: &str) -> Peer { Peer { ek, psk, role, ts: 0, route: vec![], relays: Relay::list(relays).unwrap(), mix: Mix::None, mesh: [0; 32] } }
 
     #[test]
     fn listen_gives_every_device_a_slot() {

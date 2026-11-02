@@ -143,3 +143,36 @@ async fn shared_node() {
     for d in [dh, dd] { let _ = std::fs::remove_dir_all(d); }
     let _ = lrx.try_recv();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_meshes() {
+    let _ = tracing_subscriber::fmt().with_env_filter("irpush=debug").with_test_writer().try_init();
+    let (_relay, r) = relay().await;
+    let host = |d: PathBuf| Arc::new(Node::create(d.join("s"), random32(), vec![r.clone()]).unwrap());
+    let (a, b) = (host(dir()), host(dir()));
+    let b2 = Arc::new(Node::join(dir().join("s"), random32(), &b.ticket(Role::Host).unwrap(), vec![]).unwrap());
+    let dev = Arc::new(Node::join(dir().join("s"), random32(), &a.ticket(Role::Device).unwrap(), vec![]).unwrap());
+    let (_ta, _) = run(a.clone());
+    let (_tb, _) = run(b.clone());
+    let (_tb2, _) = run(b2.clone());
+    let (_td, mut rx) = run(dev.clone());
+    until(|| dev.has(&a.id()) && b2.has(&b.id())).await;
+
+    // Another app's host: the same device joins its mesh too, and meets its other host.
+    assert!(a.add(&b.ticket(Role::Device).unwrap()).is_err(), "hosts do not join more meshes");
+    dev.add(&b.ticket(Role::Device).unwrap()).unwrap();
+    until(|| dev.has(&b.id()) && dev.has(&b2.id())).await;
+    let x = app("org.example.x");
+    a.push(dev.id(), &x, b"a").unwrap();
+    assert_eq!(recv(&mut rx).await.2, b"a");
+    b.push(dev.id(), &x, b"b").unwrap();
+    assert_eq!(recv(&mut rx).await.2, b"b");
+
+    // Mesh B cannot revoke mesh A's host on the device; its own host, yes.
+    b.revoke(a.id()).unwrap();
+    b.revoke(b2.id()).unwrap();
+    until(|| !dev.has(&b2.id())).await;
+    assert!(dev.has(&a.id()), "a revoke stays inside its mesh");
+    a.push(dev.id(), &x, b"still").unwrap();
+    assert_eq!(recv(&mut rx).await.2, b"still");
+}
