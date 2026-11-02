@@ -10,6 +10,7 @@ anyhow = "1"
 chacha20poly1305 = "0.10"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "alloc"] }
 getrandom = "0.3"
+jni = { version = "0.21", optional = true }
 hex = "0.4"
 hkdf = "0.12"
 data-encoding = "2"
@@ -29,10 +30,11 @@ x-wing = { version = "0.1.1", features = ["getrandom", "zeroize"] }
 zeroize = "1"
 
 [lib]
-crate-type = ["lib", "staticlib"] # staticlib: iOS xcframework
+crate-type = ["lib", "staticlib", "cdylib"] # iOS xcframework; Android .so
 
 [features]
 ffi = []
+jni = ["dep:jni"] # the Android library (android/)
 
 [profile.release]
 lto = true

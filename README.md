@@ -85,21 +85,32 @@ Library: `Node::{create, join, open}`, `run(callback)`, `push`, `ticket`, `revok
 `set_route` / `set_apns_key` (iOS), `network` / `kick` / `pause` (platform hooks); `local::{bind,
 serve, attach}` and `Local::deliver` for the shared node. C ABI: `src/ffi.rs` (`irp_serve` / `irp_attach`).
 
-## Android (Kotlin shell, to be written against the C ABI)
-Since Android 9 every app has its own SELinux categories: no app can reach another's Unix socket,
-abstract ones included. Across apps the broker is therefore Binder. The owner runs
-`irp_open`/`irp_join` in a `remoteMessaging` foreground service (`dataSync` stops after 6 h a day
-from Android 15) that other apps bind to (`org.irpush.ATTACH`, found with `queryIntentServices`).
-It authenticates them as `auth` does here: `Binder.getCallingUid()` -> `getPackagesForUid` ->
-`irp_app(pkg)`. Each `cb` push goes to the bound app, or, when none is bound, to an explicit
-broadcast that wakes it. `irp_serve` / `irp_attach` stay for the processes of one app and for desktops.
-Hooks:
-- `irp_network(id)` from `ConnectivityManager`, with `id` a hash of the interface name and DNS
-  servers (`wlan0` alone is every Wi-Fi), and `UINT64_MAX` when the network is lost.
-- `irp_kick()` from `AlarmManager.setAndAllowWhileIdle` (no exact-alarm permission needed), under a
-  10 s wake lock; it returns the seconds until the next alarm.
+## Android
+`android/` is a library (Kotlin shell + `libirpush.so`, feature `jni`). Add it and call one function:
 
-If the owning app is uninstalled, the state goes with it and the phone re-pairs with one ticket.
+    // settings.gradle.kts: includeBuild("irpush/android")    (this repo, e.g. as a git submodule)
+    // app/build.gradle.kts: implementation("org.irpush:irpush:0.1")
+    class App : Application() { override fun onCreate() { super.onCreate()
+        Irpush.start(this) { from, data -> /* a push for this package */ } } }
+    Irpush.id            // device id hosts push to ("" until joined)
+    Irpush.join(ticket)  // from `irpush DIR ticket`, in-band or scanned
+
+Its manifest brings the service, receivers and permissions. Every app that includes it can be the
+phone's one node; the rest share it:
+- **Election**: the irpush app installed first (`firstInstallTime`, then package name) owns the node;
+  every app computes the same answer from `queryIntentServices(org.irpush.ATTACH)`. No lock, no race.
+- **Broker**: apps bind the owner's `Broker` service (Binder, `Messenger`). The owner authenticates each
+  message by its kernel-supplied `sendingUid`: an app receives only the pushes for its own packages
+  (`irp_app(package)`). A push for an app that is not attached is held (64 per app, in memory) and the
+  app gets an explicit, data-free `org.irpush.WAKE` broadcast; it attaches and fetches. A spoofed
+  wake fetches nothing.
+- **Owner process**: a `remoteMessaging` foreground service once joined (`dataSync` stops after 6 h a
+  day from Android 15), restarted after boot and updates; network callback -> `network(id)` (hash of
+  interface and DNS servers; offline parks); `kick` from `AlarmManager.setAndAllowWhileIdle` under a
+  10 s wake lock (no exact-alarm permission). State: `filesDir/irpush.state` under 32 random bytes
+  wrapped by an Android Keystore key.
+- **Failover**: if the owner is uninstalled, the next app becomes owner with no state (`id == ""`) and
+  the phone joins again with one ticket. Bound apps follow automatically (`onBindingDied`).
 
 ## iOS
 Host, once: `irpush ~/.irpush apns KEYID TEAMID < AuthKey_KEYID.p8` (one key covers your apps).
@@ -154,8 +165,11 @@ Host queues live in memory (a host restart drops unacknowledged pushes, and repl
 non-push frames restarts with them). The protocol has not been formally verified or externally
 audited; `x-wing` (draft-06) and `ml-kem` are unaudited crates, acceptable only because the
 construction is hybrid with X25519 and a pairwise PSK. CI compiles the Swift package; no device run
-is automated. The Android shell is specified above, not yet written. On Android the node's state
-belongs to the app that first became owner; uninstalling it means one re-pair.
+is automated; the Android library is built in CI, not run on a device. On Android the node's state
+belongs to the owner app; uninstalling it means one re-pair. Any app on the phone can include the
+library, so the first one installed owns everyone's pushes (the threat model's "another irpush app";
+keep payloads to what a wake-up needs), and before the phone has joined, any of them can join it to a
+mesh of its choosing.
 
 ## Prior art
 UnifiedPush already gives Android one connection that all apps share, and FCM learns heartbeats
