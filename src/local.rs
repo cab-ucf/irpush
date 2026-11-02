@@ -14,20 +14,23 @@
 //! `@name` paths are Linux abstract sockets (no file to clean up).
 use crate::{App, EndpointId, Node};
 use anyhow::{Context, Result, bail};
-use std::{collections::HashSet, io::{BufRead, BufReader, Write}, sync::{Arc, Mutex}};
-use tokio::{io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt}, net::UnixListener, sync::mpsc};
+use std::{collections::HashSet, io::{BufRead, BufReader, Write}, sync::{Arc, Mutex}, time::Duration};
+use tokio::{io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt}, net::UnixListener, sync::{Semaphore, mpsc}, time::timeout};
+
+const MAX_CONN: usize = 64;
+const QUEUE: usize = 256; // pushes buffered per attached client; beyond, they fall through to the owner
 
 /// Attached clients: which apps each one wants.
 #[derive(Default)]
-pub struct Local(Mutex<Vec<(HashSet<App>, mpsc::UnboundedSender<String>)>>);
+pub struct Local(Mutex<Vec<(HashSet<App>, mpsc::Sender<String>)>>);
 
 impl Local {
-    /// Hand a push to every attached client that wants `app`. False: nobody attached for it.
+    /// Hand a push to every attached client that wants `app`. False: nobody attached for it (or its queue is full).
     pub fn deliver(&self, from: EndpointId, app: App, data: &[u8]) -> bool {
         let line = format!("push {} {} {}\n", hex::encode(from.as_bytes()), hex::encode(app), hex::encode(data));
         let mut l = self.0.lock().unwrap_or_else(|e| e.into_inner());
         l.retain(|c| !c.1.is_closed());
-        l.iter().filter(|c| c.0.contains(&app)).filter(|c| c.1.send(line.clone()).is_ok()).count() > 0
+        l.iter().filter(|c| c.0.contains(&app)).filter(|c| c.1.try_send(line.clone()).is_ok()).count() > 0
     }
 }
 
@@ -71,19 +74,20 @@ fn parse_apps(words: &[&str]) -> Result<HashSet<App>> {
 /// may it run one-shot commands? `cmd(line, body)`: those commands (the CLI); `Err` for none.
 pub async fn serve(node: Arc<Node>, local: Arc<Local>, l: UnixListener, allow: impl Fn(Option<u32>, &HashSet<App>) -> bool + Send + Sync + 'static,
     cmd: impl Fn(&Node, &str, Vec<u8>) -> Result<String> + Send + Sync + 'static) {
-    let (allow, cmd) = (Arc::new(allow), Arc::new(cmd));
+    let (allow, cmd, conns) = (Arc::new(allow), Arc::new(cmd), Arc::new(Semaphore::new(MAX_CONN)));
     while let Ok((mut s, _)) = l.accept().await {
-        let uid = s.peer_cred().ok().map(|c| c.uid());
-        let (node, local, allow, cmd) = (node.clone(), local.clone(), allow.clone(), cmd.clone());
+        let (Ok(c), Ok(slot)) = (s.peer_cred(), conns.clone().try_acquire_owned()) else { continue }; // unknown peer or too many: no read at all
+        let (uid, node, local, allow, cmd) = (Some(c.uid()), node.clone(), local.clone(), allow.clone(), cmd.clone());
         tokio::spawn(async move {
+            let _slot = slot;
             let mut r = tokio::io::BufReader::new(&mut s);
             let mut line = String::new();
-            if r.read_line(&mut line).await.is_err() { return }
+            if !matches!(timeout(Duration::from_secs(10), (&mut r).take(4096).read_line(&mut line)).await, Ok(Ok(_))) || !line.ends_with('\n') { return }
             let w: Vec<&str> = line.split_whitespace().collect();
             if let ["attach", apps @ ..] = w.as_slice() {
                 let Some(apps) = parse_apps(apps).ok().filter(|a| !a.is_empty()) else { let _ = s.write_all(b"error: attach APP...\n").await; return };
                 if !allow(uid, &apps) { let _ = s.write_all(b"error: not allowed\n").await; return }
-                let (tx, mut rx) = mpsc::unbounded_channel();
+                let (tx, mut rx) = mpsc::channel(QUEUE);
                 local.0.lock().unwrap_or_else(|e| e.into_inner()).push((apps, tx));
                 if s.write_all(format!("id {}\n", hex::encode(node.id().as_bytes())).as_bytes()).await.is_err() { return }
                 while let Some(m) = rx.recv().await { if s.write_all(m.as_bytes()).await.is_err() { return } }

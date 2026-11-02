@@ -37,7 +37,7 @@ use iroh_dns::dns::DnsResolver;
 use iroh_relay::{client::{Client, ClientBuilder}, protos::relay::{ClientToRelayMsg as Out, RelayToClientMsg as In}, tls};
 use proto::{Id, Kind, Rd, lp, now, rnd, tag};
 use std::{collections::{HashMap, HashSet, VecDeque}, path::{Path, PathBuf}, sync::{Mutex, MutexGuard, atomic::{AtomicBool, Ordering::Relaxed}}, time::Duration};
-use store::{Disk, Peer};
+use store::{Disk, Mix, Peer};
 use tokio::{sync::{Notify, mpsc, watch}, time::{Instant, sleep, sleep_until, timeout}};
 use tracing::{debug, info, warn};
 use x_wing::{DecapsulationKey, kem::{Decapsulator, KeyExport}};
@@ -54,6 +54,7 @@ const MAX_OUTBOX: usize = 256;
 const MAX_DEVICE_RELAYS: usize = 4; // per device
 const MAX_LISTEN: usize = 8;
 const MAX_SEEN: usize = 1 << 16; // frame ids remembered for replay rejection
+const MAX_RATE: u32 = 16; // control frames per device per minute (each Hello re-seals its queue)
 /// `Node::network(OFFLINE)`: no network; the device parks instead of retrying.
 pub const OFFLINE: u64 = u64::MAX;
 
@@ -65,7 +66,7 @@ impl Drop for Secret { fn drop(&mut self) { zeroize::Zeroize::zeroize(&mut self.
 impl Drop for Join { fn drop(&mut self) { zeroize::Zeroize::zeroize(&mut self.s) } }
 struct Pend { to: EndpointId, app: App, data: Vec<u8>, exp: Instant, apns: bool }  // re-sealed per send
 
-enum Opened { Peer(Vec<u8>), Issued(usize, Vec<u8>), Joined(Vec<u8>) }
+enum Opened { Peer(Vec<u8>, bool), Issued(usize, Vec<u8>), Joined(Vec<u8>) } // Peer: opened with the pair's previous PSK
 
 struct State {
     d: Disk,
@@ -74,7 +75,9 @@ struct State {
     join: Option<Join>,
     pending: HashMap<Id, Pend>,
     nack: HashMap<EndpointId, Instant>,       // rate limit for key-resync Hellos
-    seen: HashMap<Id, Instant>,               // non-push frame ids, until they leave the freshness window
+    seen: HashSet<Id>,                        // control frame ids, until they leave the freshness window
+    seen_q: VecDeque<(Instant, Id)>,          // ... in expiry order
+    rate: HashMap<EndpointId, (Instant, u32)>, // device: control frames this minute
     echo_until: HashMap<EndpointId, Instant>, // host: one outstanding echo per device
     via: HashMap<EndpointId, String>,         // relay each peer was last heard on
     down: HashMap<String, (Instant, Duration)>, // device: failing relays, skip until
@@ -87,7 +90,7 @@ struct State {
 impl State {
     fn new(d: Disk) -> Self {
         let dk = [DecapsulationKey::from(d.xw), DecapsulationKey::from(d.xw_prev)];
-        Self { d, dk, secrets: vec![], join: None, pending: HashMap::new(), nack: HashMap::new(), seen: HashMap::new(), echo_until: HashMap::new(), via: HashMap::new(), down: HashMap::new(), net: 0, probe: 0, echoed: false, echo_alive: false }
+        Self { d, dk, secrets: vec![], join: None, pending: HashMap::new(), nack: HashMap::new(), seen: HashSet::new(), seen_q: VecDeque::new(), rate: HashMap::new(), echo_until: HashMap::new(), via: HashMap::new(), down: HashMap::new(), net: 0, probe: 0, echoed: false, echo_alive: false }
     }
     fn id(&self) -> EndpointId { self.d.sk.public() }
     fn hb(&self, net: u64) -> Duration {
@@ -113,11 +116,14 @@ impl State {
         if up.is_empty() { all } else { up }
     }
 
-    /// Host: everywhere a member might be.
+    /// Host: everywhere a member might be. Every device's first relay, then the others' round-robin
+    /// up to MAX_LISTEN, in id order: no device crowds out another.
     fn listen(&self) -> Vec<Relay> {
-        let devices = self.d.peers.values().filter(|p| p.role == Role::Device).flat_map(|p| p.relays.iter().cloned());
-        let mut l = relay::dedup(self.d.relays.iter().cloned().chain(devices));
-        l.truncate(MAX_LISTEN);
+        let mut devs: Vec<_> = self.d.peers.iter().filter(|p| p.1.role == Role::Device).collect();
+        devs.sort_by_key(|p| p.0.as_bytes());
+        let nth = |i| devs.iter().filter_map(move |p| p.1.relays.get(i).cloned());
+        let mut l = relay::dedup(self.d.relays.iter().cloned().chain(nth(0)));
+        for r in (1..MAX_DEVICE_RELAYS).flat_map(nth) { if l.len() < MAX_LISTEN && !l.iter().any(|x| x.url == r.url) { l.push(r) } }
         relay::dedup(l.into_iter().chain(relay::fallback(&self.d.relays)))
     }
 
@@ -126,11 +132,18 @@ impl State {
         Ok(proto::seal(&p.psk, Some(&p.ek), self.id(), to, &proto::plain(kind, id, app, data)?))
     }
 
+    /// Our re-keying secret (`answer`: never answered back), sealed with `psk` (current or previous).
+    fn key(&self, to: EndpointId, psk: &[u8; 32], c: &[u8; 32], answer: bool) -> Result<Vec<u8>> {
+        let p = self.d.peers.get(&to).context("unknown peer")?;
+        Ok(proto::seal(psk, Some(&p.ek), self.id(), to, &proto::plain(Kind::Key, &rnd(), &[0; 16], &[&c[..], &[answer as u8]].concat())?))
+    }
+
     fn open(&self, from: EndpointId, f: &[u8]) -> Option<Opened> {
         let me = self.id();
         if let Some(p) = self.d.peers.get(&from) {
             let psk_hello = || proto::open_psk(&p.psk, from, me, f).filter(|pt| pt[0] == Kind::Hello as u8); // key resync only
-            if let Some(pt) = proto::open_kem(&self.dk, &p.psk, from, me, f).or_else(psk_hello) { return Some(Opened::Peer(pt)) }
+            if let Some(pt) = proto::open_kem(&self.dk, &p.psk, from, me, f).or_else(psk_hello) { return Some(Opened::Peer(pt, false)) }
+            if let Mix::Done(prev, _) = &p.mix && let Some(pt) = proto::open_kem(&self.dk, prev, from, me, f) { return Some(Opened::Peer(pt, true)) } // sent before they mixed
         } // else (or not decryptable): a pairing retry from a just-paired peer is still answered
         let t = Instant::now();
         if let Some(j) = self.join.as_ref().filter(|j| j.host == from && j.exp > t) {
@@ -161,9 +174,11 @@ pub struct Node {
 pub fn open_notification(path: &Path, kek: &[u8; 32], f_b64: &str) -> Result<Option<(EndpointId, App, Vec<u8>)>> {
     let (st, f) = (State::new(store::load(path, kek)?), BASE64.decode(f_b64.as_bytes())?);
     for from in st.d.peers.keys() { // the payload names no sender (Apple never learns it): try each peer
-        if let Some(pt) = proto::open_kem(&st.dk, &st.d.peers[from].psk, *from, st.id(), &f) {
+        let p = &st.d.peers[from];
+        let prev = || if let Mix::Done(prev, _) = &p.mix { proto::open_kem(&st.dk, prev, *from, st.id(), &f) } else { None }; // as State::open
+        if let Some(pt) = proto::open_kem(&st.dk, &p.psk, *from, st.id(), &f).or_else(prev) {
             let m = proto::parse(&pt)?;
-            return Ok((m.kind == Kind::Push && store::first_delivery(path, &m.id)?).then(|| (*from, m.app, m.data.to_vec())));
+            return Ok((m.kind == Kind::Push && store::first_delivery(path, &m.id, m.ts)?).then(|| (*from, m.app, m.data.to_vec())));
         }
     }
     Ok(None)
@@ -342,8 +357,10 @@ impl Node {
             let t = Instant::now();
             if let Some(p) = st.d.peers.get(&from).filter(|_| st.nack.get(&from).is_none_or(|x| t > *x)) {
                 let f = proto::seal(&p.psk, None, st.id(), from, &proto::plain(Kind::Hello, &rnd(), &[0; 16], &st.hello())?);
+                let key = match p.mix { Mix::Sent(c) => Some(st.key(from, &p.psk, &c, false)?), _ => None }; // or they mixed and our Key was lost
                 st.nack.insert(from, t + Duration::from_secs(60));
                 self.out(&st, from, f);
+                if let Some(k) = key { self.out(&st, from, k); }
             }
             return Ok(());
         };
@@ -351,22 +368,35 @@ impl Node {
         match opened {
             Opened::Issued(i, pt) => self.on_pair_request(&mut st, i, from, &pt),
             Opened::Joined(pt) => self.on_pair_reply(&mut st, from, &pt),
-            Opened::Peer(pt) => {
+            Opened::Peer(pt, prev) => {
                 let m = proto::parse(&pt)?;
-                // Replay: pushes are de-duplicated by the delivered-id log; every other kind here
-                // (a relay may resend any frame inside the freshness window).
-                if m.kind != Kind::Push {
-                    let t = Instant::now();
-                    if st.seen.len() >= MAX_SEEN { st.seen.retain(|_, x| *x > t); }
-                    if st.seen.insert(m.id, t + Duration::from_secs(proto::MAX_AGE + proto::MAX_SKEW)).is_some_and(|x| x > t) { return Ok(()) }
-                }
                 let host = st.d.peers.get(&from).is_some_and(|p| p.role == Role::Host);
+                if !prev && let Some(p) = st.d.peers.get_mut(&from) && let Mix::Done(..) = p.mix { p.mix = Mix::Fixed; self.save(&st)?; } // they use the mixed PSK
+                // Replay: pushes are de-duplicated by the delivered-id log, Acks are idempotent; every
+                // other kind here (a relay may resend any frame inside the freshness window). Devices
+                // are rate-limited; when full, a device's frame is dropped, a host's evicts the oldest.
+                if !matches!(m.kind, Kind::Push | Kind::Ack) {
+                    let t = Instant::now();
+                    if !host {
+                        let w = st.rate.entry(from).or_insert((t, 0));
+                        if t >= w.0 + Duration::from_secs(60) { *w = (t, 0) }
+                        w.1 += 1;
+                        if w.1 > MAX_RATE { return Ok(()) }
+                    }
+                    while let Some(&(x, id)) = st.seen_q.front() && x <= t { st.seen_q.pop_front(); st.seen.remove(&id); }
+                    if st.seen.len() >= MAX_SEEN {
+                        if !host { return Ok(()) }
+                        if let Some((_, o)) = st.seen_q.pop_front() { st.seen.remove(&o); }
+                    }
+                    if !st.seen.insert(m.id) { return Ok(()) }
+                    st.seen_q.push_back((t + Duration::from_secs(proto::MAX_AGE + proto::MAX_SKEW), m.id));
+                }
                 let mut r = Rd(m.data);
                 match m.kind {
                     Kind::Push => {
                         self.out(&st, from, st.frame(from, Kind::Ack, &rnd(), &m.id, &[])?); // app field carries the acked id
                         drop(st);
-                        if store::first_delivery(&self.path, &m.id)? { on(from, m.app, m.data); } // else retransmit / iOS extension had it
+                        if store::first_delivery(&self.path, &m.id, m.ts)? { on(from, m.app, m.data); } // else retransmit / iOS extension had it
                     }
                     Kind::Ack => { st.pending.remove(&m.app); }
                     Kind::Hello => self.on_hello(&mut st, from, &mut r)?,
@@ -374,7 +404,7 @@ impl Node {
                         let (id, role, ek, psk) = (r.id()?, Role::of(r.u8()?), r.ek()?, r.arr()?);
                         let met = role == Role::Host || st.d.role == Role::Host; // devices never take devices
                         if met && id != st.id() && !st.d.revoked.contains(&id) && !st.d.peers.contains_key(&id) {
-                            st.d.peers.insert(id, Peer { ek, psk, role, ts: 0, route: vec![], relays: vec![] });
+                            st.d.peers.insert(id, Peer { ek, psk, role, ts: 0, route: vec![], relays: vec![], mix: Mix::None });
                             self.save(&st)?;
                             self.send(&st, id, Kind::Hello, &st.hello())?;
                         }
@@ -386,6 +416,7 @@ impl Node {
                     }
                     Kind::Echo if st.d.role == Role::Host && m.data.len() == 4 => self.on_echo_request(&mut st, from, &mut r)?,
                     Kind::Echo if host => if m.data.is_empty() { st.echoed = true } else { st.echo_alive = true },
+                    Kind::Key => self.on_key(&mut st, from, prev, &mut r)?,
                     Kind::Route if st.d.role == Role::Host && !host && apns::valid(m.data) => {
                         let changed = st.d.peers.get_mut(&from).filter(|p| p.route != m.data).map(|p| p.route = m.data.to_vec()).is_some();
                         if changed { self.save(&st)?; }
@@ -407,7 +438,7 @@ impl Node {
             let ek = r.ek()?;
             let relays = if grant == Role::Device { device_relays(Relay::dec(&mut r).unwrap_or_default()) } else { vec![] };
             st.secrets[i].used = Some(from);
-            st.d.peers.insert(from, Peer { ek, psk: proto::pair_psk(&s, st.id(), from), role: grant, ts: 0, route: vec![], relays });
+            st.d.peers.insert(from, Peer { ek, psk: proto::pair_psk(&s, st.id(), from), role: grant, ts: 0, route: vec![], relays, mix: Mix::None });
             self.save(st)?;
             self.changed.notify_one();
             info!(%from, ?grant, "paired");
@@ -437,7 +468,7 @@ impl Node {
         let s = st.join.take().context("no join")?.s;
         let mut r = Rd(m.data);
         let (role, ek) = (Role::of(r.u8()?), r.ek()?);
-        st.d.peers.insert(from, Peer { ek, psk: proto::pair_psk(&s, st.id(), from), role, ts: 0, route: vec![], relays: vec![] });
+        st.d.peers.insert(from, Peer { ek, psk: proto::pair_psk(&s, st.id(), from), role, ts: 0, route: vec![], relays: vec![], mix: Mix::None });
         self.save(st)?;
         if role == Role::Host { self.send(st, from, Kind::Hello, &st.hello())?; }
         info!(%from, "joined");
@@ -455,12 +486,34 @@ impl Node {
         let relays_changed = relays != p.relays;
         if rekey { (p.ek, p.ts) = (ek, ts); }
         p.relays = relays;
-        if rekey || relays_changed { self.save(st)?; }
+        let (start, key) = match p.mix { Mix::None => { let c = rnd(); p.mix = Mix::Sent(c); (true, Some((p.psk, c))) } Mix::Sent(c) => (false, Some((p.psk, c))), Mix::Done(..) | Mix::Fixed => (false, None) };
+        if rekey || relays_changed || start { self.save(st)?; }
+        if let Some((psk, c)) = key { self.out(st, from, st.key(from, &psk, &c, false)?); } // re-key the pair between us (until done)
         if relays_changed { self.changed.notify_one(); }
         if rekey { self.send(st, from, Kind::Hello, &st.hello())?; } // answer with ours once
         if me_host && tg != tag(&st.relays_msg()) { self.send(st, from, Kind::Relays, &st.relays_msg())?; } // missed an update
         self.flush(st, Some(from));
         Ok(())
+    }
+
+    /// The pair re-keys between themselves: each side's secret travels KEM-sealed to the other, so
+    /// whoever knew the PSK before (the introducing host, a ticket's holder) cannot forge frames.
+    /// Old peers ignore Key: their pairs keep the PSK they have.
+    fn on_key(&self, st: &mut State, from: EndpointId, prev: bool, r: &mut Rd) -> Result<()> {
+        let (theirs, answer, me) = (r.arr::<32>()?, r.u8()? == 1, st.id());
+        let p = st.d.peers.get(&from).context("peer")?;
+        let sent = matches!(p.mix, Mix::Sent(_));
+        let (psk, c, mix) = match p.mix {
+            Mix::Done(old, c) => { if prev && !answer { self.out(st, from, st.key(from, &old, &c, true)?) } return Ok(()) } // our answer was lost
+            Mix::Fixed => return Ok(()),
+            Mix::None if answer => return Ok(()), // answers only what we sent
+            Mix::None => { let c = rnd(); self.out(st, from, st.key(from, &p.psk, &c, true)?); (p.psk, c, Mix::Done(p.psk, c)) }
+            Mix::Sent(c) => (p.psk, c, if answer { Mix::Fixed } else { Mix::Done(p.psk, c) }), // crossed: theirs may be in flight
+        };
+        let p = st.d.peers.get_mut(&from).context("peer")?;
+        (p.psk, p.mix) = (proto::mix_psk(&psk, (me, &c), (from, &theirs)), mix);
+        if sent { self.out(st, from, st.key(from, &st.d.peers[&from].psk, &c, true)?); } // confirm: they drop the old PSK
+        self.save(st)
     }
 
     /// Host: "reach me after N s of silence" (tests the device's inbound path). One per device at a time.
@@ -477,6 +530,7 @@ impl Node {
     }
 
     /// Host: pairwise PSK for a and b, derived from our introduction secret so re-sending is idempotent.
+    /// Only a start: the pair then mixes in secrets of its own (`on_key`).
     fn introduce(&self, st: &State, a: EndpointId, b: EndpointId) -> Result<()> {
         let psk = proto::intro_psk(&st.d.intro, a, b);
         let card = |x: EndpointId| -> Result<Vec<u8>> { let p = st.d.peers.get(&x).context("peer")?; Ok([&x.as_bytes()[..], &[p.role as u8], &p.ek.to_bytes(), &psk].concat()) };
@@ -680,29 +734,35 @@ impl Node {
     }
 
     /// Hosts post to APNs directly. `wait`: the peer looked connected; give the relay 1 s to deliver.
+    /// Throttled or failing (429, 5xx, network): retried with backoff while the push is unacked.
     async fn apns_loop(&self, mut arx: mpsc::UnboundedReceiver<(Id, bool)>, mut tlsc: rustls::ClientConfig) {
         tlsc.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        let http = match reqwest::Client::builder().tls_backend_preconfigured(tlsc).build() { Ok(h) => h, Err(e) => return warn!("apns client: {e}") };
+        let http = match reqwest::Client::builder().tls_backend_preconfigured(tlsc).timeout(Duration::from_secs(30)).build() { Ok(h) => h, Err(e) => return warn!("apns client: {e}") };
         let token = Mutex::new((String::new(), 0u64)); // JWT, reused 40 min
         let one = |id: Id, wait: bool| { let (http, token) = (&http, &token); async move {
-            if wait { sleep(Duration::from_secs(1)).await; }
-            let (to, app, route, f, auth) = {
-                let mut st = self.lock();
-                let Some(p) = st.pending.get(&id).filter(|p| !p.apns) else { return Ok(()) }; // acked meanwhile
-                let (to, app, data) = (p.to, p.app, p.data.clone());
-                let route = apns::parse_route(&st.d.peers.get(&to).context("peer")?.route, &app)?;
-                let f = BASE64.encode(&st.frame(to, Kind::Push, &id, &app, &data)?);
-                let mut t = token.lock().unwrap_or_else(|e| e.into_inner());
-                if now() > t.1 + 2400 { *t = (apns::jwt(std::str::from_utf8(&st.d.apns)?)?, now()); }
-                if let Some(p) = st.pending.get_mut(&id) { p.apns = true; }
-                (to, app, route, f, t.0.clone())
-            };
-            if let apns::Sent::Gone = apns::post(http, &route, &auth, &f).await? { // token dead: stop using it
-                let mut st = self.lock();
-                if let Some(p) = st.d.peers.get_mut(&to) { p.route = apns::remove(&p.route, &app); }
-                self.save(&st)?;
+            for d in [wait as u64, 10, 60, 300, 1800] {
+                sleep(Duration::from_secs(d)).await;
+                let (to, app, route, f, auth) = {
+                    let st = self.lock();
+                    let Some(p) = st.pending.get(&id).filter(|p| !p.apns) else { return Ok(()) }; // acked meanwhile
+                    let (to, app, data) = (p.to, p.app, p.data.clone());
+                    let route = apns::parse_route(&st.d.peers.get(&to).context("peer")?.route, &app)?;
+                    let f = BASE64.encode(&st.frame(to, Kind::Push, &id, &app, &data)?);
+                    let mut t = token.lock().unwrap_or_else(|e| e.into_inner());
+                    if now() > t.1 + 2400 { *t = (apns::jwt(std::str::from_utf8(&st.d.apns)?)?, now()); }
+                    (to, app, route, f, t.0.clone())
+                };
+                match apns::post(http, &route, &auth, &f).await? {
+                    apns::Sent::Ok => { if let Some(p) = self.lock().pending.get_mut(&id) { p.apns = true; } return Ok(()) }
+                    apns::Sent::Gone => { // token dead: stop using it
+                        let mut st = self.lock();
+                        if let Some(p) = st.d.peers.get_mut(&to) { p.route = apns::remove(&p.route, &app); }
+                        return self.save(&st);
+                    }
+                    apns::Sent::Retry(e) => info!("apns, will retry: {e}"),
+                }
             }
-            anyhow::Ok(())
+            anyhow::bail!("gave up")
         }};
         let mut inflight = FuturesUnordered::new();
         loop {
@@ -742,5 +802,52 @@ mod tests {
         // `!n0` in the mesh relays: no fallback anywhere in the mesh
         let own = Disk::new(Role::Device, Relay::list("https://mesh.example/,!n0").unwrap(), vec![]);
         assert!(State::new(own).candidates().iter().all(|r| r.url != N0));
+    }
+
+    fn peer(role: Role, ek: x_wing::EncapsulationKey, psk: [u8; 32], relays: &str) -> Peer { Peer { ek, psk, role, ts: 0, route: vec![], relays: Relay::list(relays).unwrap(), mix: Mix::None } }
+
+    #[test]
+    fn listen_gives_every_device_a_slot() {
+        let mut d = Disk::new(Role::Host, Relay::list("https://m1.example/,https://m2.example/,https://m3.example/,https://m4.example/").unwrap(), vec![]);
+        let ek = || DecapsulationKey::from(rnd::<32>()).encapsulation_key().clone();
+        d.peers.insert(iroh_base::SecretKey::from_bytes(&rnd()).public(), peer(Role::Device, ek(), rnd(), "https://a1.example/,https://a2.example/,https://a3.example/,https://a4.example/"));
+        d.peers.insert(iroh_base::SecretKey::from_bytes(&rnd()).public(), peer(Role::Device, ek(), rnd(), "https://b.example/"));
+        let l = State::new(d).listen();
+        assert!(l.iter().any(|r| r.url == "https://b.example/") && l.len() == MAX_LISTEN + 1, "one device crowds out no other (+ n0)");
+    }
+
+    /// A host that introduced a and b knows their introduction PSK; once revoked (and helped by a
+    /// relay that lies about senders) it must not be able to forge frames between them.
+    #[test]
+    fn introduced_pairs_rekey_beyond_the_introducer() {
+        let dir = std::env::temp_dir().join(format!("irpush-mix-{}", hex::encode(rnd::<4>())));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (Node::boot(dir.join("a"), rnd(), Disk::new(Role::Host, vec![], vec![])).unwrap(), Node::boot(dir.join("b"), rnd(), Disk::new(Role::Device, vec![], vec![])).unwrap());
+        let (ia, ib, ek) = (a.id(), b.id(), |n: &Node| n.lock().dk[0].encapsulation_key().clone());
+        let psk = proto::intro_psk(&rnd(), ia, ib);
+        a.lock().d.peers.insert(ib, peer(Role::Device, ek(&b), psk, ""));
+        b.lock().d.peers.insert(ia, peer(Role::Host, ek(&a), psk, ""));
+        let got = Mutex::new(vec![]);
+        let on = |_, _, d: &[u8]| got.lock().unwrap().push(d.to_vec());
+        let forge = |kind, data: &[u8]| proto::seal(&psk, Some(&ek(&b)), ia, ib, &proto::plain(kind, &rnd(), &app("x"), data).unwrap());
+        let pump = || for _ in 0..4 { for (n, m) in [(&a, &b), (&b, &a)] {
+            let fs: Vec<_> = n.outbox.lock().unwrap().drain(..).collect();
+            for (_, f) in fs { m.handle("r", n.id(), &f, &on).unwrap(); }
+        } };
+        b.handle("r", ia, &forge(Kind::Push, b"forged"), &on).unwrap();
+        assert_eq!(got.lock().unwrap().len(), 1, "before re-keying, the introducer's PSK works");
+        { let st = a.lock(); a.send(&st, ib, Kind::Hello, &st.hello()).unwrap(); } // as after an introduction
+        pump();
+        let (pa, pb) = (a.lock().d.peers[&ib].psk, b.lock().d.peers[&ia].psk);
+        assert!(pa == pb && pa != psk && [&a, &b].iter().all(|n| n.lock().d.peers.values().all(|p| p.mix == Mix::Fixed)), "mixed, confirmed");
+        b.handle("r", ia, &forge(Kind::Push, b"forged"), &on).unwrap();
+        b.handle("r", ia, &forge(Kind::Relays, &[0; 10]), &on).unwrap();
+        pump();
+        assert_eq!((a.lock().d.peers[&ib].psk, b.lock().d.peers[&ia].psk), (pa, pa));
+        a.push(ib, &app("x"), b"real").unwrap();
+        pump();
+        assert_eq!(*got.lock().unwrap(), [b"forged".to_vec(), b"real".to_vec()], "only the pair's own frames after re-keying");
+        assert!(store::load(&dir.join("b"), &b.kek).unwrap().peers[&ia].psk == pa, "persisted");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

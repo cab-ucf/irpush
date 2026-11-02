@@ -13,7 +13,7 @@ usage:
   irpush DIR route apns|sandbox TOPIC TOKENHEX   device: APNs route (iOS apps do this via the C ABI)
   irpush DIR nse < B64             decrypt an APNs payload's \"f\", as the iOS extension does
   irpush token                     random relay token, for relay.toml access.shared_token
-State key (KEK): $CREDENTIALS_DIRECTORY/irpush.kek (systemd-creds, TPM-bound), else DIR/kek.
+State key (KEK): $CREDENTIALS_DIRECTORY/irpush.kek (systemd-creds, TPM-bound; required when that is set), else DIR/kek.
 Logs: stderr, RUST_LOG (default irpush=info).";
 
 use anyhow::{Result, bail, ensure};
@@ -21,7 +21,10 @@ use irpush::{BODY, Node, Relay, Role, Svc, app, random32, write_private};
 use std::{fs, io::Read, os::unix::fs::{MetadataExt, PermissionsExt}, path::Path, sync::Arc};
 
 fn kek(dir: &Path) -> Result<[u8; 32]> {
-    let p = std::env::var_os("CREDENTIALS_DIRECTORY").map(|d| Path::new(&d).join("irpush.kek")).filter(|p| p.exists()).unwrap_or(dir.join("kek"));
+    let p = match std::env::var_os("CREDENTIALS_DIRECTORY") {
+        Some(d) => { let p = Path::new(&d).join("irpush.kek"); ensure!(p.exists(), "{}: missing (LoadCredential=irpush.kek)", p.display()); p }
+        None => { tracing::warn!("state key beside the state ({}/kek): prefer systemd-creds", dir.display()); dir.join("kek") }
+    };
     if !p.exists() { write_private(&p, &random32())?; }
     fs::read(&p)?.try_into().map_err(|_| anyhow::anyhow!("{}: must be 32 bytes", p.display()))
 }

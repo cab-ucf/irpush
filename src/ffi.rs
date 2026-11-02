@@ -1,6 +1,8 @@
 //! C ABI (Swift on iOS, Kotlin via JNI on Android, or any non-Rust app). One node per process; one
 //! process per phone owns the node; others attach (`irp_serve`/`irp_attach`; Binder across Android apps).
 //! Returns 0 on success, negative on error. All pointers are checked for NULL.
+//! The process that opens the node locks `path`'s `.lock` file for its lifetime (not on Apple
+//! platforms: iOS kills suspended apps holding locks in a shared container), so two never run one state.
 //!
 //! # Safety
 //! For every function: non-NULL pointers must be valid for the documented size (`kek` 32 B, ids 32 B,
@@ -8,6 +10,8 @@
 #![allow(clippy::missing_safety_doc)] // documented once above
 use crate::{Local, Node, Relay, Svc, app, local, open_notification};
 use std::{ffi::{CStr, c_char, c_void}, path::Path, sync::{Arc, OnceLock}};
+#[cfg(not(target_vendor = "apple"))]
+static LOCK: OnceLock<std::fs::File> = OnceLock::new();
 
 static NODE: OnceLock<Arc<Node>> = OnceLock::new();
 static STATUS: OnceLock<(StatusCb, Ctx)> = OnceLock::new();
@@ -35,8 +39,18 @@ unsafe fn s<'a>(p: *const c_char) -> Option<&'a str> { if p.is_null() { None } e
 unsafe fn k(p: *const u8) -> Option<[u8; 32]> { if p.is_null() { None } else { Some(unsafe { *(p as *const [u8; 32]) }) } }
 unsafe fn relays(r: *const c_char) -> Vec<Relay> { unsafe { s(r) }.and_then(|r| Relay::list(r).ok()).unwrap_or_default() }
 
-fn start(n: anyhow::Result<Node>, cb: Cb, ctx: *mut c_void) -> i32 {
-    let n = match n { Ok(n) => Arc::new(n), Err(e) => { tracing::warn!("irpush: {e:#}"); return -1 } };
+/// -4: another process runs this node (attach to it instead).
+fn start(path: &str, n: impl FnOnce() -> anyhow::Result<Node>, cb: Cb, ctx: *mut c_void) -> i32 {
+    if NODE.get().is_some() { return -2 }
+    #[cfg(not(target_vendor = "apple"))]
+    if LOCK.get().is_none() {
+        let Ok(f) = std::fs::File::create(Path::new(path).with_extension("lock")) else { return -1 };
+        if f.try_lock().is_err() { return -4 }
+        let _ = LOCK.set(f);
+    }
+    #[cfg(target_vendor = "apple")]
+    let _ = path;
+    let n = match n() { Ok(n) => Arc::new(n), Err(e) => { tracing::warn!("irpush: {e:#}"); return -1 } };
     if NODE.set(n.clone()).is_err() { return -2 }
     let ctx = Ctx(ctx);
     std::thread::spawn(move || {
@@ -67,14 +81,16 @@ pub extern "C" fn irp_status(cb: StatusCb, ctx: *mut c_void) -> i32 { if STATUS.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn irp_join(path: *const c_char, kek: *const u8, ticket: *const c_char, relays_: *const c_char, cb: Cb, ctx: *mut c_void) -> i32 {
     let (Some(p), Some(kek), Some(t)) = (unsafe { s(path) }, unsafe { k(kek) }, unsafe { s(ticket) }) else { return -3 };
-    start(Node::join(p, kek, t, unsafe { relays(relays_) }), cb, ctx)
+    let r = unsafe { relays(relays_) };
+    start(p, || Node::join(p, kek, t, r), cb, ctx)
 }
 
 /// Every later launch.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn irp_open(path: *const c_char, kek: *const u8, relays_: *const c_char, cb: Cb, ctx: *mut c_void) -> i32 {
     let (Some(p), Some(kek)) = (unsafe { s(path) }, unsafe { k(kek) }) else { return -3 };
-    start(Node::open(p, kek, unsafe { relays(relays_) }), cb, ctx)
+    let r = unsafe { relays(relays_) };
+    start(p, || Node::open(p, kek, r), cb, ctx)
 }
 
 /// APNs device token from didRegisterForRemoteNotificationsWithDeviceToken. `topic`: bundle id.
@@ -136,13 +152,14 @@ pub unsafe extern "C" fn irp_app(name: *const c_char, out: *mut u8) -> i32 {
 }
 
 /// Notification Service Extension: decrypt userInfo["f"] on the phone. Needs no running node.
-/// Returns payload length; -1: not ours or already delivered; -2: error or `cap` too small.
+/// Returns payload length; -1: not ours or already delivered; -2: error or `cap` < 1536 (checked
+/// first: a push is marked delivered when it opens).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn irp_notification(path: *const c_char, kek: *const u8, f: *const c_char, from: *mut u8, app: *mut u8, out: *mut u8, cap: usize) -> isize {
     let (Some(p), Some(kek), Some(f)) = (unsafe { s(path) }, unsafe { k(kek) }, unsafe { s(f) }) else { return -2 };
-    if from.is_null() || app.is_null() || out.is_null() { return -2 }
+    if from.is_null() || app.is_null() || out.is_null() || cap < crate::BODY { return -2 }
     match open_notification(Path::new(p), &kek, f) {
-        Ok(Some((id, a, d))) if d.len() <= cap => unsafe {
+        Ok(Some((id, a, d))) => unsafe {
             from.copy_from_nonoverlapping(id.as_bytes().as_ptr(), 32);
             app.copy_from_nonoverlapping(a.as_ptr(), 16);
             out.copy_from_nonoverlapping(d.as_ptr(), d.len());

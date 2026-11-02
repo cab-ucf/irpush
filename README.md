@@ -50,7 +50,10 @@ infrastructure; one optional VPS improves Android battery and privacy.
   to APNs and the app's Notification Service Extension decrypts it *on the phone*.
 - **Frames**: 2715 B, always. X-Wing (ML-KEM-768 + X25519) per frame to the recipient's key, plus a
   pairwise PSK, bound to sender, recipient and direction; ChaCha20-Poly1305. Timestamped (25 h
-  window) and de-duplicated by id. State at rest: one XChaCha20-Poly1305 file under a platform key.
+  window) and de-duplicated by id. The PSK a ticket or an introducing host gives a pair is only a
+  start: on first contact the pair mixes in one secret from each side, each sealed to the other's
+  X-Wing key (`Key` frames), so neither that host (even once revoked) nor a ticket's holder can
+  forge frames between them. Pairs with a peer older than this keep the given PSK. State at rest: one XChaCha20-Poly1305 file under a platform key.
 - **Relay hop**: TLS 1.3 with X25519MLKEM768 key exchange (rustls, aws-lc-rs provider), so the
   metadata the relay hop carries (endpoint ids, tokens) is not harvest-now-decrypt-later exposed either.
 
@@ -63,6 +66,7 @@ infrastructure; one optional VPS improves Android battery and privacy.
 | A paired device | its own traffic, its hosts | learn other devices through irpush, add members, revoke, change relays, impersonate hosts |
 | Holder of an unused ticket (10 min) | | pair as the role the ticket grants; treat tickets as secrets |
 | A host | everything of its mesh | (hosts are trusted infrastructure by design) |
+| A revoked host (even with a relay lying about senders) | | forge frames between members it introduced, once they mixed their PSK |
 | Another irpush app on the phone | if it is the owner: every app's pushes on that phone | attach for an app id its uid's packages do not hash to |
 
 Forward secrecy: weekly X-Wing key rotation; a stolen device key exposes at most one epoch of
@@ -116,10 +120,11 @@ Info.plist (both): `IrpushGroup = group.your.app`; app, optional: `IrpushRelays 
     }
 
 ## Your own relay (optional VPS)
-`irpush.<you>` is iroh's relay with one change: it pings clients every 3 h instead of every 15 s, so
-phones drive their own learned heartbeats. It is token-gated and rate-limited. The token embedded in
-an app is not a secret: it keeps strangers off the relay, and the rate limits bound what a holder can
-use. A stock `iroh.<you>` relay can share the box (`irohDomain`), routed by SNI on :443.
+`irpush.<you>` is iroh's relay with one change: it pings a client only after 130 min of silence
+instead of every 15 s, so phones drive their own learned heartbeats (up to 2 h). It is token-gated
+and rate-limited: bytes per connection (iroh-relay), new connections (nftables) and open ones
+(nginx) per source IP; sockets idle for 135 min are closed. The token embedded in an app is not a
+secret: it keeps strangers off the relay, and the limits bound what a holder can use. A stock `iroh.<you>` relay can share the box (`irohDomain`), routed by SNI on :443.
 
 On DigitalOcean (the smallest droplet that installs is 2 GB; Hetzner works too):
 1. Create an Ubuntu droplet with an SSH key used only for it. Add an A record `irpush.<you>` -> its IP.
@@ -145,15 +150,18 @@ Chatter: a device sends on state changes only (one Hello per host when it connec
 network, one Ack per push), plus the one keepalive its NAT needs: a ping per learned heartbeat, 12 a
 day at 2 h. Devices meet hosts only, so key rotations and introductions never reach sleeping phones.
 
-Replay: pushes are de-duplicated by a delivered-id log shared with the iOS extension (locked), every
-other frame kind by an in-memory id set over the 25 h freshness window. Long-lived secrets are wiped
+Replay: pushes are de-duplicated by a delivered-id log shared with the iOS extension (locked; ids
+kept for the 25 h window, and when too many, a push sealed before the newest dropped one counts as
+delivered), Acks are idempotent, every other kind is de-duplicated by an in-memory id set over the
+window (bounded; devices are limited to 16 such frames a minute). Long-lived secrets are wiped
 from memory when dropped.
 
 ## Tests
 `cargo test`: frame crypto (binding, tamper, freshness), state round trip, relay parsing, APNs JWT and
 per-app routes, an end-to-end mesh over an in-process relay (late-host pairing, introductions, two
 hosts, offline queue, parking with no network, revocation, identity and key guards), the shared node
-(attach, device id, fall-through to the owner, refused attach, single owner), and the `!n0` opt-out.
+(attach, device id, fall-through to the owner, refused attach, single owner), the `!n0` opt-out, PSK
+mixing against a forging introducer, per-device listen slots, and the delivered-id log's trimming.
 CI also runs clippy with `-D warnings`, `cargo audit`, and builds the iOS xcframework and Swift package.
 
 ## Limits

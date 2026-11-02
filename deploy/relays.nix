@@ -1,5 +1,8 @@
 # The irpush relay, and optionally a stock iroh relay beside it, behind one :443 routed by SNI (TLS
 # passes through untouched; each relay does its own Let's Encrypt). MSS clamped so every TCP segment fits WireGuard on a minimum-MTU (1280) path.
+# Abuse bounds live here, not in iroh-relay (its accept_conn_* limits are unimplemented in 1.4.1, and
+# behind the proxy it sees only 127.0.0.1): per source IP, nftables caps new connections and nginx
+# concurrent ones; idle sockets close after 135 min; iroh-relay caps each client's bytes.
 self: { config, lib, pkgs, ... }:
 let
   cfg = config.services.irpushRelays;
@@ -41,7 +44,7 @@ let
       contact = cfg.email;
       cert_dir = "/var/lib/iroh-relay";
     };
-    limits = { accept_conn_limit = 50.0; accept_conn_burst = 200; client.rx = { bytes_per_second = 4194304; max_burst_bytes = 16777216; }; };
+    limits.client.rx = { bytes_per_second = 4194304; max_burst_bytes = 16777216; };
   };
   pushConf = toml.generate "irpush-relay-base.toml" {
     http_bind_addr = "127.0.0.1:8082";
@@ -54,8 +57,8 @@ let
       contact = cfg.email;
       cert_dir = "/var/lib/irpush-relay";
     };
-    # pushes are tiny; this bounds what anyone holding the (app-embedded) token can take
-    limits = { accept_conn_limit = 20.0; accept_conn_burst = 100; client.rx = { bytes_per_second = 65536; max_burst_bytes = 1048576; }; };
+    # pushes are tiny; this bounds what anyone holding the (app-embedded) token can take per connection
+    limits.client.rx = { bytes_per_second = 65536; max_burst_bytes = 1048576; };
   };
 in {
   options.services.irpushRelays = {
@@ -76,6 +79,7 @@ in {
         AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
         CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
         ExecStart = "${pkg.iroh-relay}/bin/iroh-relay --config-path ${irohConf}";
+        LimitNOFILE = 16384;
       };
     };
 
@@ -98,12 +102,17 @@ in {
         WorkingDirectory = "/var/lib/irpush-relay";
         CapabilityBoundingSet = [ "" ];
         ExecStart = "${pkg.irpush-relay}/bin/iroh-relay --config-path /run/irpush-relay/relay.toml";
+        LimitNOFILE = 16384;
       };
     };
 
+    systemd.services.nginx.serviceConfig.LimitNOFILE = 65536;
     services.nginx = {
       enable = true;
+      appendConfig = "worker_rlimit_nofile 65536;";
+      eventsConfig = "worker_connections 16384;"; # two per proxied client
       streamConfig = ''
+        limit_conn_zone $binary_remote_addr zone=perip:4m;
         map $ssl_preread_server_name $relay {
           ${cfg.irpushDomain} 127.0.0.1:8442;
           default ${if iroh then "127.0.0.1:8441" else "127.0.0.1:8442"};
@@ -112,13 +121,26 @@ in {
           listen 443;
           ssl_preread on;
           proxy_pass $relay;
-          proxy_timeout 3h; # > irpush's 2 h max heartbeat (default 10 min would cut idle sockets)
+          limit_conn perip 32; # phones of one household share an IP; a CGNAT'd crowd needs more
+          proxy_timeout 135m;  # > irpush's 2 h max heartbeat and the relay's 130 min ping: closes half-open sockets
         }
       '';
     };
 
     networking.nftables = {
       enable = true;
+      tables.conns = { # new connections per source (IPv6: per /64): burst 30, then 30 a minute
+        family = "inet";
+        content = ''
+          set new4 { type ipv4_addr; flags dynamic, timeout; timeout 1m; size 65536; }
+          set new6 { type ipv6_addr; flags dynamic, timeout; timeout 1m; size 65536; }
+          chain in {
+            type filter hook input priority filter; policy accept;
+            tcp dport 443 ct state new update @new4 { ip saddr limit rate over 30/minute burst 30 packets } drop
+            tcp dport 443 ct state new update @new6 { ip6 saddr and ffff:ffff:ffff:ffff:: limit rate over 30/minute burst 30 packets } drop
+          }
+        '';
+      };
       tables.mss = {
         family = "inet";
         content = ''
