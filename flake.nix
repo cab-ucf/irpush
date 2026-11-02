@@ -33,7 +33,7 @@
           doCheck = false;
         };
         iroh-relay = relay pkgs "iroh-relay" [ ];                                # stock: iroh data relay
-        irpush-relay = relay pkgs "irpush-relay" [ ./deploy/relay-ping.patch ];  # 1 h server ping: clients drive heartbeats
+        irpush-relay = relay pkgs "irpush-relay" [ ./deploy/relay-ping.patch ];  # 3 h server ping: clients drive heartbeats
       });
 
       nixosModules.relays = import ./deploy/relays.nix self;

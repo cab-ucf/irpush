@@ -114,7 +114,7 @@ Info.plist (both): `IrpushGroup = group.your.app`; app, optional: `IrpushRelays 
     }
 
 ## Your own relays (optional VPS)
-`iroh.<you>` (stock iroh relay) and `irpush.<you>` (1 h server ping so clients drive heartbeats;
+`iroh.<you>` (stock iroh relay) and `irpush.<you>` (3 h server ping so clients drive heartbeats;
 token-gated; rate-limited) share :443 by SNI on one NixOS box. The token embedded in an app is
 not a secret: it keeps strangers off the relay, and rate limits bound what a holder can use.
 
@@ -127,14 +127,16 @@ grace period `make token-drop`. The VPS clamps TCP MSS to 1120 (fits WireGuard o
 keeps logs at warn level for 7 days, and can upgrade itself nightly (`autoUpgrade`).
 
 ## Battery
-One socket per phone; heartbeats up to 28 min (learned per network, persisted); any inbound traffic
+One socket per phone; heartbeats up to 2 h (learned per network, persisted; RFC 5382 has NATs keep
+idle TCP 2 h 4 min), hosts every 28 min; any inbound traffic
 counts as a heartbeat; relay preference re-checked only on wakeups that happen anyway; failing relays
 backed off (5 min .. 6 h); no network (`network(OFFLINE)`) parks the device with no retries at all.
 Stock iroh relays (n0's, or yours unpatched) ping every client every 15 s, which keeps a phone's
 radio awake: the battery target needs the patched relay below. `!n0` keeps a mesh off n0's.
 
-Chatter: frames go only where they are needed. Devices meet hosts only, so key rotations and
-introductions never fan out to phones that are asleep.
+Chatter: a device sends on state changes only (one Hello per host when it connects or changes
+network, one Ack per push), plus the one keepalive its NAT needs: a ping per learned heartbeat, 12 a
+day at 2 h. Devices meet hosts only, so key rotations and introductions never reach sleeping phones.
 
 Replay: pushes are de-duplicated by a delivered-id log shared with the iOS extension (locked), every
 other frame kind by an in-memory id set over the 25 h freshness window. Long-lived secrets are wiped

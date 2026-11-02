@@ -111,7 +111,7 @@ in {
           listen 443;
           ssl_preread on;
           proxy_pass $relay;
-          proxy_timeout 1h; # > irpush's 28 min max heartbeat (default 10 min would cut idle sockets)
+          proxy_timeout 3h; # > irpush's 2 h max heartbeat (default 10 min would cut idle sockets)
         }
       '';
     };
