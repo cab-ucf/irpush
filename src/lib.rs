@@ -13,16 +13,18 @@
 //! Trust model: hosts are trusted infrastructure. Only hosts issue tickets, introduce, revoke and set
 //! mesh relays. A stolen device can be revoked and cannot add members.
 mod apns;
-#[cfg(feature = "ffi")]
+#[cfg(all(feature = "ffi", unix))]
 pub mod ffi;
 #[cfg(feature = "jni")]
 mod jni;
+#[cfg(unix)] // a Unix socket: desktops and one app's processes
 pub mod local;
 mod proto;
 mod relay;
 mod store;
 
 pub use apns::Svc;
+#[cfg(unix)]
 pub use local::Local;
 pub use proto::{App, BODY, FRAME, app};
 pub use relay::{N0, NO_N0, Relay, is_n0};
