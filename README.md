@@ -92,14 +92,14 @@ Library: `Node::{create, join, open}`, `run(callback)`, `push`, `ticket`, `revok
 serve, attach}` and `Local::deliver` for the shared node. C ABI: `src/ffi.rs` (`irp_serve` / `irp_attach`).
 
 ## Android
-`android/` is a library (Kotlin shell + `libirpush.so`, feature `jni`). Add it and call one function:
+`android/irpush` is a Kotlin library; the app links the irpush crate with feature `jni` into its own
+native library (one Rust runtime per app). Include it with the app's own Gradle plugins:
 
-    // settings.gradle.kts: includeBuild("irpush/android")    (this repo, e.g. as a git submodule)
-    // app/build.gradle.kts: implementation("org.irpush:irpush:0.1")
+    // settings: include(":irpush"); project(":irpush").projectDir = file("irpush/android/irpush")
+    // app: implementation(project(":irpush"))      Cargo: irpush = { ..., features = ["jni"] }
     class App : Application() { override fun onCreate() { super.onCreate()
-        Irpush.start(this) { from, data -> /* a push for this package */ } } }
-    Irpush.id            // device id hosts push to ("" until joined)
-    Irpush.join(ticket)  // from `irpush DIR ticket`, in-band or scanned
+        Irpush.start(this, "mylib", onId = { id -> }) { from, data -> /* a push for this package */ } } }
+    Irpush.join(ticket) { ok -> }   // a host's ticket; also into a second mesh (below)
 
 Its manifest brings the service, receivers and permissions. Every app that includes it can be the
 phone's one node; the rest share it:
@@ -115,6 +115,11 @@ phone's one node; the rest share it:
   interface and DNS servers; offline parks); `kick` from `AlarmManager.setAndAllowWhileIdle` under a
   10 s wake lock (no exact-alarm permission). State: `filesDir/irpush.state` under 32 random bytes
   wrapped by an Android Keystore key.
+- **Several meshes**: apps on one phone may be served by different hosts (your desktop, someone
+  else's server). The device joins each mesh with that mesh's ticket (`Node::add`). Its peers are tagged
+  with the mesh they came from: a host can revoke only peers of its own mesh, and only the first
+  mesh sets the device's relays. The device announces the relays it uses, so every mesh's hosts listen
+  there; while redeeming a ticket it waits where that ticket's host listens.
 - **Failover**: if the owner is uninstalled, the next app becomes owner with no state (`id == ""`) and
   the phone joins again with one ticket. Bound apps follow automatically (`onBindingDied`).
 
@@ -184,8 +189,9 @@ construction is hybrid with X25519 and a pairwise PSK. CI compiles the Swift pac
 is automated; the Android library is built in CI, not run on a device. On Android the node's state
 belongs to the owner app; uninstalling it means one re-pair. Any app on the phone can include the
 library, so the first one installed owns everyone's pushes (the threat model's "another irpush app";
-keep payloads to what a wake-up needs), and before the phone has joined, any of them can join it to a
-mesh of its choosing.
+keep payloads to what a wake-up needs), and any of them can join it to more meshes, whose hosts can
+then push to every app on the phone: treat a push as an untrusted wake-up (`from` names its host).
+Joined meshes' hosts learn the relays the device uses, relay tokens included.
 
 ## Prior art
 UnifiedPush already gives Android one connection that all apps share, and FCM learns heartbeats

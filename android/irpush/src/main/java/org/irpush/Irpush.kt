@@ -41,11 +41,14 @@ private const val HELLO = 1
 private const val ID = 2
 private const val PUSH = 3
 private const val JOIN = 4
+private const val JOINED = 5
 
+/** In the app's own native library: it links the irpush crate with feature `jni`. */
 internal object Native {
-    init { System.loadLibrary("irpush") }
+    init { System.loadLibrary(Irpush.lib) }
     @JvmStatic external fun start(path: String, kek: ByteArray, ticket: String?): String?
     @JvmStatic external fun next(): ByteArray
+    @JvmStatic external fun has(host: String): Boolean
     @JvmStatic external fun app(name: String): ByteArray
     @JvmStatic external fun network(id: Long)
     @JvmStatic external fun kick(): Long
@@ -71,15 +74,19 @@ object Irpush {
     /** This phone's device id: what hosts push to. "" not joined, null not known yet. */
     @Volatile var id: String? = null
         private set
+    internal var lib = "irpush"
     private var onPush: ((String, ByteArray) -> Unit)? = null
+    private var onId: (String) -> Unit = {}
+    private var joined: (Boolean) -> Unit = {}
     private lateinit var app: Context
     private var to: Messenger? = null
     private var bound: ComponentName? = null
 
     private val me = Messenger(Handler(Looper.getMainLooper()) { m ->
         when (m.what) {
-            ID -> id = m.data.getString("id").also { if (!it.isNullOrEmpty()) up() }
+            ID -> m.data.getString("id")!!.let { id = it; if (it.isNotEmpty()) up(); onId(it) }
             PUSH -> onPush?.invoke(m.data.getString("from")!!, m.data.getByteArray("d")!!)
+            JOINED -> joined(m.data.getBoolean("ok")).also { joined = {} }
         }
         true
     })
@@ -94,14 +101,22 @@ object Irpush {
         override fun onNullBinding(n: ComponentName) = reconnect()
     }
 
-    fun start(ctx: Context, onPush: (from: String, data: ByteArray) -> Unit) {
+    /** [lib]: the app's native library that links irpush (feature `jni`).
+     *  [onId]: the device id, whenever it is learnt ("" until joined). */
+    fun start(ctx: Context, lib: String, onId: (String) -> Unit = {}, onPush: (from: String, data: ByteArray) -> Unit) {
         app = ctx.applicationContext
+        this.lib = lib
+        this.onId = onId
         this.onPush = onPush
         connect()
     }
 
-    /** Join a mesh with a host's ticket (no-op once joined). */
-    fun join(ticket: String) = send(JOIN, Bundle().apply { putString("t", ticket) })
+    /** Join a host's mesh with its ticket (also when already in another);
+     *  [done] says whether its host answered. */
+    fun join(ticket: String, done: (Boolean) -> Unit = {}) = main.post {
+        joined = done
+        send(JOIN, Bundle().apply { putString("t", ticket) })
+    }
 
     internal fun connect() = main.post {
         if (!::app.isInitialized || bound != null) return@post
@@ -135,8 +150,9 @@ private object Hub {
     val me by lazy { Messenger(Handler(Looper.getMainLooper()) { m -> handle(m); true }) }
 
     fun open(ticket: String?) {
-        if (id != null) return
+        val was = id
         id = Native.start(File(ctx.filesDir, "irpush.state").path, kek(ctx), ticket) ?: return
+        if (was != null) return
         ctx.getSystemService(ConnectivityManager::class.java)
             .registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
                 override fun onLinkPropertiesChanged(n: Network, lp: LinkProperties) =
@@ -157,13 +173,20 @@ private object Hub {
 
     fun handle(m: Message) {
         val r = m.replyTo ?: return
-        if (m.what == JOIN) m.data.getString("t")?.let(::open)
+        if (m.what == JOIN) m.data.getString("t")?.takeIf { it.length > 72 }?.let { open(it); wait(it.substring(8, 72), r, 120) }
         // Authenticated by the kernel: the calling uid's packages, and only theirs.
         for (a in ctx.packageManager.getPackagesForUid(m.sendingUid).orEmpty().map { Native.app(it).hex() }) {
             clients[a] = r
             held.remove(a)?.forEach { route(a, it) }
         }
         runCatching { r.send(Message.obtain(null, ID).apply { data = Bundle().apply { putString("id", id ?: "") } }) }
+    }
+
+    /** Until the ticket's host answers (or a minute): tell the joining app. */
+    private fun wait(host: String, r: Messenger, n: Int) {
+        val ok = id != null && Native.has(host)
+        if (!ok && n > 0) { main.postDelayed({ wait(host, r, n - 1) }, 500); return }
+        runCatching { r.send(Message.obtain(null, JOINED).apply { data = Bundle().apply { putBoolean("ok", ok) } }) }
     }
 
     fun route(app: String, b: Bundle) {

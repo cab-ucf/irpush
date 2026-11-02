@@ -1,6 +1,6 @@
 [package]
 name = "irpush"
-version = "0.1.0"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.89"
 license = "GPL-3.0-or-later"
@@ -30,11 +30,11 @@ x-wing = { version = "0.1.1", features = ["getrandom", "zeroize"] }
 zeroize = "1"
 
 [lib]
-crate-type = ["lib", "staticlib", "cdylib"] # iOS xcframework; Android .so
+crate-type = ["lib", "staticlib"] # staticlib: iOS xcframework
 
 [features]
 ffi = []
-jni = ["dep:jni"] # the Android library (android/)
+jni = ["dep:jni"] # for android/: enable in the app's own native library
 
 [profile.release]
 lto = true
