@@ -2,6 +2,8 @@
 name = "irpush"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = "1"
@@ -13,10 +15,11 @@ hkdf = "0.12"
 data-encoding = "2"
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
-rustls = { version = "0.23", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "prefer-post-quantum"] }
 iroh-base = "1.4.1"
 iroh-dns = "1.4.1"
-iroh-relay = "1.4.1"
+# aws-lc-rs: the only rustls provider with X25519MLKEM768, so the relay hop is post-quantum too.
+iroh-relay = { version = "1.4.1", default-features = false, features = ["tls-aws-lc-rs"] }
 sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
@@ -35,4 +38,4 @@ lto = true
 strip = true
 
 [dev-dependencies]
-iroh-relay = { version = "1.4.1", features = ["server"] }
+iroh-relay = { version = "1.4.1", default-features = false, features = ["server", "tls-aws-lc-rs"] }
