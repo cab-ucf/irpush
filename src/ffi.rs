@@ -1,5 +1,5 @@
 //! C ABI (Swift on iOS, Kotlin via JNI on Android, or any non-Rust app). One node per process; one
-//! process per phone owns the node and serves `irp_serve`, the others `irp_attach` to it.
+//! process per phone owns the node; others attach (`irp_serve`/`irp_attach`; Binder across Android apps).
 //! Returns 0 on success, negative on error. All pointers are checked for NULL.
 //!
 //! # Safety
@@ -86,8 +86,8 @@ pub unsafe extern "C" fn irp_route(sandbox: bool, topic: *const c_char, token: *
     n.set_route(if sandbox { Svc::ApnsSandbox } else { Svc::Apns }, t, tok).map_or(-1, |_| 0)
 }
 
-/// Owner, after `irp_join`/`irp_open`: serve `sock` ("@name": Linux abstract socket, reachable from
-/// other apps) so other irpush apps can attach. -1: another process owns it (attach instead).
+/// Owner, after `irp_join`/`irp_open`: serve `sock` ("@name": Linux abstract socket) so other
+/// processes can attach (desktops; on Android, one app's processes: across apps use Binder). -1: another process owns it (attach instead).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn irp_serve(sock: *const c_char, auth: AuthCb, ctx: *mut c_void) -> i32 {
     let (Some(n), Some(p)) = (NODE.get().cloned(), unsafe { s(sock) }) else { return -3 };
@@ -116,7 +116,8 @@ pub unsafe extern "C" fn irp_attach(sock: *const c_char, apps: *const u8, n: usi
 #[unsafe(no_mangle)] pub extern "C" fn irp_pause(p: bool) { if let Some(n) = NODE.get() { n.pause(p) } }
 /// Stable id of the current network; `u64::MAX` = offline (the device parks).
 #[unsafe(no_mangle)] pub extern "C" fn irp_network(id: u64) { if let Some(n) = NODE.get() { n.network(id) } }
-#[unsafe(no_mangle)] pub extern "C" fn irp_kick() { if let Some(n) = NODE.get() { n.kick() } }
+/// Heartbeat now (from an alarm); returns the seconds until the next alarm, 0 with no node.
+#[unsafe(no_mangle)] pub extern "C" fn irp_kick() -> u32 { NODE.get().map_or(0, |n| n.kick().as_secs() as u32) }
 
 /// This device's id (32 bytes): what hosts push to.
 #[unsafe(no_mangle)]

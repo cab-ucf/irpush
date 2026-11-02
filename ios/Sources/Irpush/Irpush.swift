@@ -63,9 +63,10 @@ public enum Irpush {
         let ok = !FileManager.default.fileExists(atPath: path) && ticket != nil ? irp_join(path, k, ticket!, relays, cb, nil) == 0 : irp_open(path, k, relays, cb, nil) == 0
         guard ok else { return false }
         let m = NWPathMonitor()
-        m.pathUpdateHandler = { p in // hashValue is reseeded per launch: the learned heartbeat must key on a stable id
+        m.pathUpdateHandler = { p in // a stable id per network: interface plus gateways (en0 alone is every Wi-Fi)
             guard p.status == .satisfied, let i = p.availableInterfaces.first else { return irp_network(UInt64.max) } // offline: park
-            irp_network(SHA256.hash(data: Data(i.name.utf8)).prefix(8).reduce(UInt64(0)) { $0 << 8 | UInt64($1) })
+            let id = ([i.name] + p.gateways.map { "\($0)" }).joined(separator: " ")
+            irp_network(SHA256.hash(data: Data(id.utf8)).prefix(8).reduce(UInt64(0)) { $0 << 8 | UInt64($1) })
         }
         m.start(queue: .global(qos: .utility))
         monitor = m

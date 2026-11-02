@@ -68,6 +68,14 @@ async fn mesh() {
     until(|| h2.peers().len() == 2 && dev.peers().len() == 2).await;
     assert!(h1.ticket(Role::Device).is_ok() && dev.ticket(Role::Device).is_err(), "only hosts issue tickets");
 
+    // Another device meets the hosts only: one host can serve many people's phones.
+    let d4 = dir();
+    let dev2 = Arc::new(Node::join(d4.join("s"), random32(), &h1.ticket(Role::Device).unwrap(), vec![]).unwrap());
+    let (_t4, _) = run(dev2.clone());
+    until(|| dev2.peers().len() == 2).await;
+    sleep(Duration::from_millis(500)).await;
+    assert!(dev.peers().iter().chain(&dev2.peers()).all(|p| p.1 == Role::Host), "devices never meet");
+
     let (a, id) = (app("org.example.chat"), dev.id());
     h1.push(id, &a, b"from h1").unwrap();
     assert_eq!(recv(&mut drx).await, (h1.id(), a, b"from h1".to_vec()));
@@ -96,7 +104,7 @@ async fn mesh() {
     until(|| !h1.peers().iter().any(|p| p.0 == id)).await;
     assert!(h1.push(id, &a, b"x").is_err());
     assert!(Node::open(d1.join("s"), random32(), vec![]).is_err(), "wrong state key");
-    for d in [d1, d2, d3] { let _ = std::fs::remove_dir_all(d); }
+    for d in [d1, d2, d3, d4] { let _ = std::fs::remove_dir_all(d); }
 }
 
 /// One node per phone: a second app attaches over the local socket and gets its pushes; pushes for

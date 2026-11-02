@@ -87,6 +87,7 @@ impl State {
         Self { d, dk, secrets: vec![], join: None, pending: HashMap::new(), nack: HashMap::new(), seen: HashMap::new(), echo_until: HashMap::new(), via: HashMap::new(), down: HashMap::new(), net: 0, echoed: false, echo_alive: false }
     }
     fn id(&self) -> EndpointId { self.d.sk.public() }
+    fn hb(&self, net: u64) -> Duration { self.d.hb.get(&net).map_or(HB.0, |s| Duration::from_secs((s & !SETTLED) as u64)) }
     fn ek(&self) -> Vec<u8> { self.dk[0].encapsulation_key().to_bytes().to_vec() }
     fn hosts(&self) -> Vec<EndpointId> { self.d.peers.iter().filter(|p| p.1.role == Role::Host).map(|p| *p.0).collect() }
     fn relays_msg(&self) -> Vec<u8> { [&self.d.relays_ver.to_le_bytes()[..], &Relay::enc(&self.d.relays)].concat() }
@@ -287,8 +288,13 @@ impl Node {
     /// Android: ConnectivityManager.NetworkCallback; iOS: NWPathMonitor (any stable id per network).
     /// `OFFLINE` when there is no network: the device parks until the next call.
     pub fn network(&self, id: u64) { self.lock().net = id; self.reset.notify_waiters(); }
-    /// Android: AlarmManager.setExactAndAllowWhileIdle (in-process timers stall during suspend).
-    pub fn kick(&self) { self.kick.notify_one(); }
+    /// Android: from an AlarmManager alarm (in-process timers stall during suspend): heartbeat now.
+    /// Returns when to call again: this network's learned heartbeat.
+    pub fn kick(&self) -> Duration {
+        self.kick.notify_one();
+        let st = self.lock();
+        st.hb(st.net)
+    }
     /// iOS: true when backgrounded, so hosts switch to APNs immediately.
     pub fn pause(&self, p: bool) { self.paused.store(p, Relaxed); self.reset.notify_waiters(); }
 
@@ -360,10 +366,11 @@ impl Node {
                     Kind::Hello => self.on_hello(&mut st, from, &mut r)?,
                     Kind::Intro if host => {
                         let (id, role, ek, psk) = (r.id()?, Role::of(r.u8()?), r.ek()?, r.arr()?);
-                        if id != st.id() && !st.d.revoked.contains(&id) && !st.d.peers.contains_key(&id) {
+                        let met = role == Role::Host || st.d.role == Role::Host; // devices never take devices
+                        if met && id != st.id() && !st.d.revoked.contains(&id) && !st.d.peers.contains_key(&id) {
                             st.d.peers.insert(id, Peer { ek, psk, role, ts: 0, route: vec![], relays: vec![] });
                             self.save(&st)?;
-                            if role == Role::Host || st.d.role == Role::Host { self.send(&st, id, Kind::Hello, &st.hello())?; }
+                            self.send(&st, id, Kind::Hello, &st.hello())?;
                         }
                     }
                     Kind::Revoke if host => { let id = r.id()?; drop(st); self.apply_revoke(id)?; }
@@ -403,7 +410,8 @@ impl Node {
         // introductions are idempotent (deterministic PSK), so a lost frame never splits a pair.
         let reply = proto::plain(Kind::Pair, &rnd(), &[0; 16], &[&[st.d.role as u8][..], &st.ek()].concat())?;
         self.out(st, from, proto::seal(&s, None, st.id(), from, &reply));
-        let others: Vec<_> = st.d.peers.keys().filter(|p| **p != from).copied().collect();
+        // Devices meet hosts only: a host may serve many people's phones without telling one of another.
+        let others: Vec<_> = st.d.peers.iter().filter(|p| *p.0 != from && (grant == Role::Host || p.1.role == Role::Host)).map(|p| *p.0).collect();
         for o in others { self.introduce(st, from, o)?; }
         Ok(())
     }
@@ -493,7 +501,7 @@ impl Node {
     /// candidate relay, plus the APNs sender.
     pub async fn run(&self, on: impl Fn(EndpointId, App, &[u8])) -> Result<()> {
         let arx = self.arx.lock().unwrap_or_else(|e| e.into_inner()).take().context("run called twice")?;
-        let tlsc = tls::CaTlsConfig::default().client_config(tls::default_provider())?; // shared: TLS resumption
+        let tlsc = tls::CaTlsConfig::default().client_config(pq())?; // shared: TLS resumption
         let dns = DnsResolver::new();                                                    // shared: DNS cache
         let relays = async {
             if self.role() == Role::Device { return self.relay_loop(None, &tlsc, &dns, &on).await }
@@ -588,7 +596,7 @@ impl Node {
         // Heartbeat learning tests the INBOUND path: a host echoes after the candidate idle time.
         // Outbound pings alone pass behind NATs/VPNs (e.g. WireGuard without PersistentKeepalive)
         // whose mapping still accepts our ping but already drops unsolicited inbound pushes.
-        let hb = |st: &State| st.d.hb.get(&net).map_or(HB.0, |s| Duration::from_secs((s & !SETTLED) as u64));
+        let hb = |st: &State| st.hb(net);
         let settled = |st: &State| st.d.hb.get(&net).is_some_and(|s| s & SETTLED != 0);
         let learn = |st: &mut State, h: Duration, done: bool| -> Result<()> {
             let v = h.as_secs() as u32 | if done { SETTLED } else { 0 };
@@ -698,6 +706,10 @@ impl Node {
     }
 }
 
+/// aws-lc-rs, X25519MLKEM768 first. Never iroh-relay's `default_provider`: it is ring (classical)
+/// whenever the embedding app's iroh enables `tls-ring`, as iroh's defaults do.
+fn pq() -> std::sync::Arc<rustls::crypto::CryptoProvider> { rustls::crypto::aws_lc_rs::default_provider().into() }
+
 /// Relays a device may make hosts dial: public https names only, a few per device.
 fn device_relays(l: Vec<Relay>) -> Vec<Relay> {
     l.into_iter().filter(|r| r.public().is_ok()).take(MAX_DEVICE_RELAYS).collect()
@@ -706,6 +718,11 @@ fn device_relays(l: Vec<Relay>) -> Vec<Relay> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn relay_hop_is_post_quantum_in_any_embedding() {
+        assert_eq!(pq().kx_groups[0].name(), rustls::NamedGroup::X25519MLKEM768);
+    }
+
     #[test]
     fn n0_is_always_the_last_resort() {
         let mut d = Disk::new(Role::Device, Relay::list("https://mesh.example/").unwrap(), Relay::list("https://app.example/").unwrap());

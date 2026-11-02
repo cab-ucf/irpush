@@ -4,13 +4,14 @@
 //! `attach`es its app ids, then receives their pushes over the socket. The kernel's bind is the
 //! election: if the owner dies, the next app whose connect fails binds and becomes the owner.
 //! Pushes for apps that are not attached fall through to the owner's platform callback (which can
-//! wake the app). Peers are authenticated by uid: the desktop allows its own uid, Android glue
-//! maps the uid to package names and checks them against the app ids.
+//! wake the app). Peers are authenticated by uid: the desktop allows its own uid.
+//! Android apps cannot reach each other's sockets (per-app SELinux categories since Android 9):
+//! there the broker is Binder (README), and this socket serves the processes of one app.
 //!
 //! Protocol (UTF-8 lines, one request per connection, all binary fields hex):
 //!   attach APP [APP...]   -> `id DEVICE` then `push FROM APP DATA` per push, until EOF
 //!   anything else         -> the owner's command handler (the CLI's push/ticket/revoke/...), one reply
-//! `@name` paths are Linux abstract sockets (reachable across Android app sandboxes).
+//! `@name` paths are Linux abstract sockets (no file to clean up).
 use crate::{App, EndpointId, Node};
 use anyhow::{Context, Result, bail};
 use std::{collections::HashSet, io::{BufRead, BufReader, Write}, sync::{Arc, Mutex}};

@@ -19,7 +19,8 @@ int32_t irp_attach(const char *sock, const uint8_t *apps, size_t n, irp_cb cb, v
 void irp_pause(bool p);
 /* stable id of the current network; UINT64_MAX = offline (no reconnect attempts until the next call) */
 void irp_network(uint64_t id);
-void irp_kick(void);
+/* heartbeat now (from an alarm); returns seconds until the next alarm */
+uint32_t irp_kick(void);
 int32_t irp_id(uint8_t *out);
 int32_t irp_app(const char *name, uint8_t *out);
 /* Notification Service Extension: payload length, -1 not ours/duplicate, -2 error. */

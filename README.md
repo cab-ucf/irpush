@@ -34,13 +34,14 @@ infrastructure; one optional VPS improves Android battery and privacy.
   show a notice. Heartbeats are learned per network by testing the *inbound* path (a host
   echoes after the candidate silence), so NATs and VPNs that silently drop inbound traffic
   (e.g. WireGuard without PersistentKeepalive) are detected rather than assumed alive.
-- **One node per phone**: the first irpush app binds the local socket (`@irpush`, a Linux abstract
-  socket on Android; `DIR/sock` on desktops) and runs the node; every later app connects and
-  `attach`es its app ids, receiving their pushes over that socket. The kernel's bind is the election:
+- **One node per phone**: the first irpush app runs the node and serves it (`DIR/sock` on desktops,
+  Binder on Android, see below); every later app `attach`es its app ids and receives their pushes. The kernel's bind is the election:
   when the owner dies, the next app whose connect fails binds and takes over. Pushes for apps that
   are not attached reach the owner's platform callback, which wakes them. The owner authenticates
   attaching processes by uid (Android: uid -> package names -> `irp_app(package)`). The owner process
   decrypts every frame, so the apps of one phone trust each other as they trust the OS.
+- **Devices meet hosts only**: hosts are introduced to everyone, devices never to each other, so one
+  host can serve many people's phones without telling one of another.
 - **iOS**: Apple forbids sockets across apps, so apps of one team share the identity through the App
   Group (one device id, one APNs route per app, sent as `Route` frames) and each foreground app holds
   the socket while it runs. In the background the socket is closed; hosts post the same sealed frame
@@ -57,7 +58,7 @@ infrastructure; one optional VPS improves Android battery and privacy.
 | Relay operator (yours, the app developer's, n0 fallback) | endpoint ids, IPs, timing, direction | read, forge, replay into acceptance, learn app/kind/size |
 | Apple (iOS) | bundle id, device token, timing, fixed size | read, learn the sending host |
 | Network / VPN | as relay operator, minus ids (TLS) | as relay operator |
-| A paired device | its own traffic | add members, revoke, change relays, impersonate hosts |
+| A paired device | its own traffic, its hosts | learn other devices, add members, revoke, change relays, impersonate hosts |
 | Holder of an unused ticket (10 min) | | pair as the role the ticket grants; treat tickets as secrets |
 | A host | everything of its mesh | (hosts are trusted infrastructure by design) |
 | Another irpush app on the phone | if it is the owner: every app's pushes on that phone | attach for an app id its uid's packages do not hash to |
@@ -85,14 +86,20 @@ Library: `Node::{create, join, open}`, `run(callback)`, `push`, `ticket`, `revok
 serve, attach}` and `Local::deliver` for the shared node. C ABI: `src/ffi.rs` (`irp_serve` / `irp_attach`).
 
 ## Android (Kotlin shell, to be written against the C ABI)
-On start: `irp_attach("@irpush", apps, cb)`; on -1, `irp_open`/`irp_join` then `irp_serve("@irpush",
-auth)`, where `auth(uid, app)` checks `irp_app(pkg) == app` for every package of that uid
-(`PackageManager.getPackagesForUid`). The owner runs as a foreground service (`dataSync`); for a
-push nobody attached, `cb` sends an explicit broadcast to the package registered for that app id. Hooks:
-`irp_network(sha256(interface name))` from `ConnectivityManager`, `irp_kick` from
-`AlarmManager.setExactAndAllowWhileIdle`. When an attached app gets `cb(from == NULL)` the owner is
-gone: attach again, else become the owner (the state file stays with the first owner's app; if that app
-is uninstalled the phone re-pairs with one ticket).
+Since Android 9 every app has its own SELinux categories: no app can reach another's Unix socket,
+abstract ones included. Across apps the broker is therefore Binder. The owner runs
+`irp_open`/`irp_join` in a `remoteMessaging` foreground service (`dataSync` stops after 6 h a day
+from Android 15) that other apps bind to (`org.irpush.ATTACH`, found with `queryIntentServices`).
+It authenticates them as `auth` does here: `Binder.getCallingUid()` -> `getPackagesForUid` ->
+`irp_app(pkg)`. Each `cb` push goes to the bound app, or, when none is bound, to an explicit
+broadcast that wakes it. `irp_serve` / `irp_attach` stay for the processes of one app and for desktops.
+Hooks:
+- `irp_network(id)` from `ConnectivityManager`, with `id` a hash of the interface name and DNS
+  servers (`wlan0` alone is every Wi-Fi), and `UINT64_MAX` when the network is lost.
+- `irp_kick()` from `AlarmManager.setAndAllowWhileIdle` (no exact-alarm permission needed), under a
+  10 s wake lock; it returns the seconds until the next alarm.
+
+If the owning app is uninstalled, the state goes with it and the phone re-pairs with one ticket.
 
 ## iOS
 Host, once: `irpush ~/.irpush apns KEYID TEAMID < AuthKey_KEYID.p8` (one key covers your apps).
@@ -123,7 +130,11 @@ keeps logs at warn level for 7 days, and can upgrade itself nightly (`autoUpgrad
 One socket per phone; heartbeats up to 28 min (learned per network, persisted); any inbound traffic
 counts as a heartbeat; relay preference re-checked only on wakeups that happen anyway; failing relays
 backed off (5 min .. 6 h); no network (`network(OFFLINE)`) parks the device with no retries at all.
-On n0 (zero infrastructure) its 15 s server pings cost Android battery; `!n0` opts a mesh out.
+Stock iroh relays (n0's, or yours unpatched) ping every client every 15 s, which keeps a phone's
+radio awake: the battery target needs the patched relay below. `!n0` keeps a mesh off n0's.
+
+Chatter: frames go only where they are needed. Devices meet hosts only, so key rotations and
+introductions never fan out to phones that are asleep.
 
 Replay: pushes are de-duplicated by a delivered-id log shared with the iOS extension (locked), every
 other frame kind by an in-memory id set over the 25 h freshness window. Long-lived secrets are wiped
@@ -144,4 +155,11 @@ construction is hybrid with X25519 and a pairwise PSK. CI compiles the Swift pac
 is automated. The Android shell is specified above, not yet written. On Android the node's state
 belongs to the app that first became owner; uninstalling it means one re-pair.
 
-License: MIT OR Apache-2.0.
+## Prior art
+UnifiedPush already gives Android one connection that all apps share, and FCM learns heartbeats
+adaptively; Web Push (RFC 8291) seals payloads end to end. irpush differs in three ways: it needs no
+push server beyond your own iroh hosts, its heartbeat is learned by testing the inbound path, and every
+frame is post-quantum and constant-size. Its Android shell could also act as a UnifiedPush
+distributor for apps that can POST to a host.
+
+License: GPL-3.0-or-later.
