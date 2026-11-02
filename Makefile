@@ -23,6 +23,9 @@ token:
 token-add:
 	$(SSH) 'openssl rand -hex 32 >> $(T) && systemctl restart irpush-relay && tail -1 $(T)'
 
+bump:
+	nix flake update
+
 token-drop:
 	$(SSH) 'tail -1 $(T) > $(T).new && mv $(T).new $(T) && systemctl restart irpush-relay && cat $(T)'
 
@@ -35,4 +38,4 @@ ios:
 	  -library target/aarch64-apple-ios-sim/release/libirpush.a -headers ios/include \
 	  -output Irpush.xcframework
 
-.PHONY: build deploy update token token-add token-drop ios
+.PHONY: build deploy update bump token token-add token-drop ios

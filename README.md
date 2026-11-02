@@ -115,15 +115,20 @@ Info.plist (both): `IrpushGroup = group.your.app`; app, optional: `IrpushRelays 
         override func render(app: Data, data: Data) -> (title: String, body: String) { ("Chat", String(decoding: data, as: UTF8.self)) }
     }
 
-## Your own relays (optional VPS)
-`iroh.<you>` (stock iroh relay) and `irpush.<you>` (3 h server ping so clients drive heartbeats;
-token-gated; rate-limited) share :443 by SNI on one NixOS box. The token embedded in an app is
-not a secret: it keeps strangers off the relay, and rate limits bound what a holder can use.
+## Your own relay (optional VPS)
+`irpush.<you>` is iroh's relay with one change: it pings clients every 3 h instead of every 15 s, so
+phones drive their own learned heartbeats. It is token-gated and rate-limited. The token embedded in
+an app is not a secret: it keeps strangers off the relay, and the rate limits bound what a holder can
+use. A stock `iroh.<you>` relay can share the box (`irohDomain`), routed by SNI on :443.
 
-1. A VPS (DigitalOcean 2 GB for the install, or Hetzner) with a dedicated SSH key; both DNS names -> its IP.
-2. Edit `deploy/config.nix`. `make deploy HOST=ip` (nixos-anywhere, built on the VPS). Later `make update`.
-3. `make token HOST=ip` -> `https://irpush.<you>#TOKEN` in your app, or `irpush DIR relays ...` for a mesh.
+On DigitalOcean (the smallest droplet that installs is 2 GB; Hetzner works too):
+1. Create an Ubuntu droplet with an SSH key used only for it. Add an A record `irpush.<you>` -> its IP.
+2. In `deploy/config.nix`, set your domain, email and that SSH public key.
+3. `make deploy HOST=<ip>`: nixos-anywhere replaces Ubuntu with NixOS, built on the droplet.
+4. `make token HOST=<ip>`: prints the token. Use `https://irpush.<you>#TOKEN` as your app's relay,
+   `irpush DIR relays ...` for a mesh, or `services.irch.pushRelay` on an irch storage node.
 
+Later: `make update HOST=<ip>` applies changes; `make bump` moves the pinned nixpkgs and disko first.
 Rotate after a revoke: `make token-add`, `irpush DIR relays "https://irpush.<you>#NEW"`, then after a
 grace period `make token-drop`. The VPS clamps TCP MSS to 1120 (fits WireGuard on a 1280-byte path),
 keeps logs at warn level for 7 days, and can upgrade itself nightly (`autoUpgrade`).

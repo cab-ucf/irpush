@@ -105,7 +105,7 @@ pub unsafe extern "C" fn irp_serve(sock: *const c_char, auth: AuthCb, ctx: *mut 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn irp_attach(sock: *const c_char, apps: *const u8, n: usize, cb: Cb, ctx: *mut c_void, out_id: *mut u8) -> i32 {
     let Some(p) = (unsafe { s(sock) }).filter(|_| !apps.is_null() && n > 0 && !out_id.is_null()) else { return -3 };
-    let apps: Vec<crate::App> = unsafe { std::slice::from_raw_parts(apps, 16 * n) }.chunks_exact(16).map(|c| c.try_into().expect("16")).collect();
+    let apps: Vec<crate::App> = unsafe { std::slice::from_raw_parts(apps, 16 * n) }.as_chunks::<16>().0.to_vec();
     let (c1, c2) = (Ctx(ctx), Ctx(ctx));
     match local::attach(p, &apps, move |from, app, d| cb(c1.get(), from.as_bytes().as_ptr(), app.as_ptr(), d.as_ptr(), d.len()), move || cb(c2.get(), std::ptr::null(), std::ptr::null(), std::ptr::null(), 0)) {
         Ok(id) => { unsafe { out_id.copy_from_nonoverlapping(id.as_bytes().as_ptr(), 32) }; 0 }

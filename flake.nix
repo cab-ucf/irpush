@@ -2,8 +2,9 @@
   description = "irpush: post-quantum E2EE push for iroh apps, plus an optional relay VPS";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
-    disko = { url = "github:nix-community/disko"; inputs.nixpkgs.follows = "nixpkgs"; };
+    # Pinned by flake.lock; `make bump` moves both.
+    nixpkgs.url = "https://channels.nixos.org/nixos-26.05/nixexprs.tar.xz";
+    disko = { url = "git+https://github.com/nix-community/disko"; inputs.nixpkgs.follows = "nixpkgs"; };
   };
 
   outputs = { self, nixpkgs, disko }:
