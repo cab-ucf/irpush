@@ -1,8 +1,9 @@
-# Two relays behind one :443, routed by SNI (TLS passes through untouched; each relay does its own
-# Let's Encrypt). MSS clamped so every TCP segment fits WireGuard on a minimum-MTU (1280) path.
+# The irpush relay, and optionally a stock iroh relay beside it, behind one :443 routed by SNI (TLS
+# passes through untouched; each relay does its own Let's Encrypt). MSS clamped so every TCP segment fits WireGuard on a minimum-MTU (1280) path.
 self: { config, lib, pkgs, ... }:
 let
   cfg = config.services.irpushRelays;
+  iroh = cfg.irohDomain != null;
   pkg = self.packages.${pkgs.stdenv.hostPlatform.system};
   toml = pkgs.formats.toml { };
   mss = "1120"; # 1280 - IPv6/TCP inner (60) - WireGuard over IPv6 (80) - TCP options margin (20)
@@ -58,14 +59,14 @@ let
   };
 in {
   options.services.irpushRelays = {
-    enable = lib.mkEnableOption "iroh relay + irpush relay";
-    irohDomain = lib.mkOption { type = lib.types.str; };
+    enable = lib.mkEnableOption "irpush relay (+ iroh relay)";
+    irohDomain = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; }; # null: irpush only
     irpushDomain = lib.mkOption { type = lib.types.str; };
     email = lib.mkOption { type = lib.types.str; };
   };
 
   config = lib.mkIf cfg.enable {
-    systemd.services.iroh-relay = {
+    systemd.services.iroh-relay = lib.mkIf iroh {
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
@@ -105,7 +106,7 @@ in {
       streamConfig = ''
         map $ssl_preread_server_name $relay {
           ${cfg.irpushDomain} 127.0.0.1:8442;
-          default 127.0.0.1:8441;
+          default ${if iroh then "127.0.0.1:8441" else "127.0.0.1:8442"};
         }
         server {
           listen 443;
@@ -132,7 +133,7 @@ in {
         '';
       };
     };
-    networking.firewall = { allowedTCPPorts = [ 22 80 443 ]; allowedUDPPorts = [ 7842 ]; };
+    networking.firewall = { allowedTCPPorts = [ 22 443 ] ++ lib.optional iroh 80; allowedUDPPorts = lib.optional iroh 7842; };
 
     boot.kernel.sysctl = {
       "net.ipv4.tcp_mtu_probing" = 1; # recover from black holes the clamp cannot cover (e.g. WireGuard in WireGuard)
