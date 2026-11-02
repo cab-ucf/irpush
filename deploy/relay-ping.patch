@@ -5,7 +5,7 @@
  /// chance of recovering.
  #[cfg(feature = "server")]
 -pub(crate) const PING_INTERVAL: Duration = Duration::from_secs(15);
-+pub(crate) const PING_INTERVAL: Duration = Duration::from_secs(3600);
++pub(crate) const PING_INTERVAL: Duration = Duration::from_secs(3 * 3600);
  
  /// The number of packets buffered for sending per client
  #[cfg(feature = "server")]

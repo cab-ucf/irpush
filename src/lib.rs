@@ -45,7 +45,9 @@ use x_wing::{DecapsulationKey, kem::{Decapsulator, KeyExport}};
 const TICKET_TTL: Duration = Duration::from_secs(600);
 const ROTATE: u64 = 7 * 86400; // X-Wing key epoch (forward secrecy)
 const PUSH_TTL: Duration = Duration::from_secs(86400);
-const HB: (Duration, Duration) = (Duration::from_secs(120), Duration::from_secs(28 * 60));
+// Learned per network up to RFC 5382's floor for NAT TCP idle timeouts (2 h 4 min).
+const HB: (Duration, Duration) = (Duration::from_secs(120), Duration::from_secs(2 * 3600));
+const HOST_HB: Duration = Duration::from_secs(28 * 60); // hosts (wired, not learned)
 const SETTLED: u32 = 1 << 31; // learned heartbeat: inbound limit found, stop probing
 const MAX_PENDING: usize = 256; // per peer
 const MAX_OUTBOX: usize = 256;
@@ -77,6 +79,7 @@ struct State {
     via: HashMap<EndpointId, String>,         // relay each peer was last heard on
     down: HashMap<String, (Instant, Duration)>, // device: failing relays, skip until
     net: u64,
+    probe: u64, // device: unix time a heartbeat probe ends (suspend stops monotonic clocks)
     echoed: bool,
     echo_alive: bool,
 }
@@ -84,10 +87,13 @@ struct State {
 impl State {
     fn new(d: Disk) -> Self {
         let dk = [DecapsulationKey::from(d.xw), DecapsulationKey::from(d.xw_prev)];
-        Self { d, dk, secrets: vec![], join: None, pending: HashMap::new(), nack: HashMap::new(), seen: HashMap::new(), echo_until: HashMap::new(), via: HashMap::new(), down: HashMap::new(), net: 0, echoed: false, echo_alive: false }
+        Self { d, dk, secrets: vec![], join: None, pending: HashMap::new(), nack: HashMap::new(), seen: HashMap::new(), echo_until: HashMap::new(), via: HashMap::new(), down: HashMap::new(), net: 0, probe: 0, echoed: false, echo_alive: false }
     }
     fn id(&self) -> EndpointId { self.d.sk.public() }
-    fn hb(&self, net: u64) -> Duration { self.d.hb.get(&net).map_or(HB.0, |s| Duration::from_secs((s & !SETTLED) as u64)) }
+    fn hb(&self, net: u64) -> Duration {
+        if self.d.role == Role::Host { return HOST_HB }
+        self.d.hb.get(&net).map_or(HB.0, |s| Duration::from_secs((s & !SETTLED) as u64))
+    }
     fn ek(&self) -> Vec<u8> { self.dk[0].encapsulation_key().to_bytes().to_vec() }
     fn hosts(&self) -> Vec<EndpointId> { self.d.peers.iter().filter(|p| p.1.role == Role::Host).map(|p| *p.0).collect() }
     fn relays_msg(&self) -> Vec<u8> { [&self.d.relays_ver.to_le_bytes()[..], &Relay::enc(&self.d.relays)].concat() }
@@ -289,11 +295,11 @@ impl Node {
     /// `OFFLINE` when there is no network: the device parks until the next call.
     pub fn network(&self, id: u64) { self.lock().net = id; self.reset.notify_waiters(); }
     /// Android: from an AlarmManager alarm (in-process timers stall during suspend): heartbeat now.
-    /// Returns when to call again: this network's learned heartbeat.
+    /// Returns when to call again: the end of a heartbeat probe, else the learned heartbeat.
     pub fn kick(&self) -> Duration {
         self.kick.notify_one();
-        let st = self.lock();
-        st.hb(st.net)
+        let (st, t) = (self.lock(), now());
+        if st.probe > t { Duration::from_secs(st.probe - t) } else { st.hb(st.net) }
     }
     /// iOS: true when backgrounded, so hosts switch to APNs immediately.
     pub fn pause(&self, p: bool) { self.paused.store(p, Relaxed); self.reset.notify_waiters(); }
@@ -605,11 +611,12 @@ impl Node {
         };
         let probe_start = |st: &mut State| -> Result<Option<(Instant, Duration)>> {
             let (h, host) = (hb(st), st.hosts().first().copied());
+            st.probe = 0;
             let Some(host) = host.filter(|_| st.d.role == Role::Device && !settled(st) && h < HB.1) else { return Ok(None) };
-            let c = (h * 2).min(HB.1);
-            (st.echoed, st.echo_alive) = (false, false);
+            let (c, slack) = ((h * 2).min(HB.1), Duration::from_secs(20));
+            (st.echoed, st.echo_alive, st.probe) = (false, false, now() + (c + slack).as_secs());
             self.send(st, host, Kind::Echo, &(c.as_secs() as u32).to_le_bytes())?;
-            Ok(Some((Instant::now() + c + Duration::from_secs(20), c)))
+            Ok(Some((Instant::now() + c + slack, c)))
         };
         let mut probe = probe_start(&mut self.lock())?;
         let mut retry = Instant::now() + Duration::from_secs(5); // pairing retries, only while joining
@@ -636,6 +643,7 @@ impl Node {
                     { // no lock may live across an await (keeps run() Send)
                         let mut st = self.lock();
                         if probe.take().is_some() {
+                            st.probe = 0;
                             if st.echo_alive { // host alive, echo lost: inbound dies before 2x. Keep current, stop probing.
                                 let h = hb(&st);
                                 learn(&mut st, h, true)?;
@@ -664,7 +672,8 @@ impl Node {
                     self.pair_request(&st)?;
                     retry = Instant::now() + Duration::from_secs(5);
                 }
-                _ = self.kick.notified() => if probe.is_none() { due = Instant::now() },
+                // An alarm: heartbeat now, or end a probe the phone slept through (wall clock).
+                _ = self.kick.notified() => if probe.is_none() || now() >= self.lock().probe { due = Instant::now() },
                 _ = &mut reset => bail!("reconnect (network change or pause)"),
             }
         }
