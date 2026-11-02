@@ -41,7 +41,9 @@ infrastructure; one optional VPS improves Android battery and privacy.
   attaching processes by uid (Android: uid -> package names -> `irp_app(package)`). The owner process
   decrypts every frame, so the apps of one phone trust each other as they trust the OS.
 - **Devices meet hosts only**: hosts are introduced to everyone, devices never to each other, so one
-  host can serve many people's phones without telling one of another.
+  host can serve many people's phones without telling one of another. irpush only wakes: apps find
+  and reach each other's devices in their own protocol (irch: a space's signed member and device
+  lists, then iroh by endpoint id), and push through a host only to wake one.
 - **iOS**: Apple forbids sockets across apps, so apps of one team share the identity through the App
   Group (one device id, one APNs route per app, sent as `Route` frames) and each foreground app holds
   the socket while it runs. In the background the socket is closed; hosts post the same sealed frame
@@ -58,7 +60,7 @@ infrastructure; one optional VPS improves Android battery and privacy.
 | Relay operator (yours, the app developer's, n0 fallback) | endpoint ids, IPs, timing, direction | read, forge, replay into acceptance, learn app/kind/size |
 | Apple (iOS) | bundle id, device token, timing, fixed size | read, learn the sending host |
 | Network / VPN | as relay operator, minus ids (TLS) | as relay operator |
-| A paired device | its own traffic, its hosts | learn other devices, add members, revoke, change relays, impersonate hosts |
+| A paired device | its own traffic, its hosts | learn other devices through irpush, add members, revoke, change relays, impersonate hosts |
 | Holder of an unused ticket (10 min) | | pair as the role the ticket grants; treat tickets as secrets |
 | A host | everything of its mesh | (hosts are trusted infrastructure by design) |
 | Another irpush app on the phone | if it is the owner: every app's pushes on that phone | attach for an app id its uid's packages do not hash to |
