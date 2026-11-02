@@ -1,0 +1,11 @@
+--- a/src/protos/relay.rs	2006-07-24 01:21:28.000000000 +0000
++++ b/src/protos/relay.rs	2026-10-31 02:55:43.265794405 +0000
+@@ -33,7 +33,7 @@
+ /// The default QUIC max_idle_timeout is 30s, so setting that to half this time gives some
+ /// chance of recovering.
+ #[cfg(feature = "server")]
+-pub(crate) const PING_INTERVAL: Duration = Duration::from_secs(15);
++pub(crate) const PING_INTERVAL: Duration = Duration::from_secs(3600);
+ 
+ /// The number of packets buffered for sending per client
+ #[cfg(feature = "server")]

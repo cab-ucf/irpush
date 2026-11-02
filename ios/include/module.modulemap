@@ -1,0 +1,4 @@
+module IrpushC {
+    header "irpush.h"
+    export *
+}

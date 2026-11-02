@@ -1,0 +1,38 @@
+[package]
+name = "irpush"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+chacha20poly1305 = "0.10"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "alloc"] }
+getrandom = "0.3"
+hex = "0.4"
+hkdf = "0.12"
+data-encoding = "2"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
+rustls = { version = "0.23", default-features = false }
+iroh-base = "1.4.1"
+iroh-dns = "1.4.1"
+iroh-relay = "1.4.1"
+sha2 = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
+url = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-std", "io-util", "fs"] }
+x-wing = { version = "0.1.1", features = ["getrandom", "zeroize"] }
+
+[lib]
+crate-type = ["lib", "staticlib"] # staticlib: iOS xcframework
+
+[features]
+ffi = []
+
+[profile.release]
+lto = true
+strip = true
+
+[dev-dependencies]
+iroh-relay = { version = "1.4.1", features = ["server"] }
