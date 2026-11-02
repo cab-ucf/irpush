@@ -132,8 +132,9 @@ from memory when dropped.
 ## Tests
 `cargo test`: frame crypto (binding, tamper, freshness), state round trip, relay parsing, APNs JWT and
 per-app routes, an end-to-end mesh over an in-process relay (late-host pairing, introductions, two
-hosts, offline queue, revocation, identity and key guards), and the shared node (attach, device id,
-fall-through to the owner, refused attach, single owner).
+hosts, offline queue, parking with no network, revocation, identity and key guards), the shared node
+(attach, device id, fall-through to the owner, refused attach, single owner), and the `!n0` opt-out.
+CI also runs clippy with `-D warnings`, `cargo audit`, and builds the iOS xcframework and Swift package.
 
 ## Limits
 Host queues live in memory (a host restart drops unacknowledged pushes, and replay protection for
