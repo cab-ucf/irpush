@@ -17,6 +17,7 @@ typedef bool (*irp_auth_cb)(void *ctx, uint32_t uid, const uint8_t *app);
 int32_t irp_serve(const char *sock, irp_auth_cb auth, void *ctx);
 int32_t irp_attach(const char *sock, const uint8_t *apps, size_t n, irp_cb cb, void *ctx, uint8_t *out_id);
 void irp_pause(bool p);
+/* stable id of the current network; UINT64_MAX = offline (no reconnect attempts until the next call) */
 void irp_network(uint64_t id);
 void irp_kick(void);
 int32_t irp_id(uint8_t *out);

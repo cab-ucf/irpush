@@ -64,8 +64,8 @@ public enum Irpush {
         guard ok else { return false }
         let m = NWPathMonitor()
         m.pathUpdateHandler = { p in // hashValue is reseeded per launch: the learned heartbeat must key on a stable id
-            let d = SHA256.hash(data: Data((p.availableInterfaces.first?.name ?? "").utf8))
-            irp_network(d.prefix(8).reduce(UInt64(0)) { $0 << 8 | UInt64($1) })
+            guard p.status == .satisfied, let i = p.availableInterfaces.first else { return irp_network(UInt64.max) } // offline: park
+            irp_network(SHA256.hash(data: Data(i.name.utf8)).prefix(8).reduce(UInt64(0)) { $0 << 8 | UInt64($1) })
         }
         m.start(queue: .global(qos: .utility))
         monitor = m

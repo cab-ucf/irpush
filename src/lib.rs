@@ -23,7 +23,7 @@ mod store;
 pub use apns::Svc;
 pub use local::Local;
 pub use proto::{App, BODY, FRAME, app};
-pub use relay::{N0, Relay, is_n0};
+pub use relay::{N0, NO_N0, Relay, is_n0};
 pub use store::{Role, write_private};
 
 /// 32 random bytes from the OS (KEKs, relay tokens).
@@ -51,11 +51,16 @@ const MAX_PENDING: usize = 256; // per peer
 const MAX_OUTBOX: usize = 256;
 const MAX_DEVICE_RELAYS: usize = 4; // per device
 const MAX_LISTEN: usize = 8;
+const MAX_SEEN: usize = 1 << 16; // frame ids remembered for replay rejection
+/// `Node::network(OFFLINE)`: no network; the device parks instead of retrying.
+pub const OFFLINE: u64 = u64::MAX;
 
 type Tx = mpsc::UnboundedSender<(EndpointId, Vec<u8>)>;
 
 struct Secret { s: [u8; 32], grant: Role, exp: Instant, used: Option<EndpointId> } // issued by this host
 struct Join { host: EndpointId, s: [u8; 32], exp: Instant }                         // ticket being redeemed
+impl Drop for Secret { fn drop(&mut self) { zeroize::Zeroize::zeroize(&mut self.s) } }
+impl Drop for Join { fn drop(&mut self) { zeroize::Zeroize::zeroize(&mut self.s) } }
 struct Pend { to: EndpointId, app: App, data: Vec<u8>, exp: Instant, apns: bool }  // re-sealed per send
 
 enum Opened { Peer(Vec<u8>), Issued(usize, Vec<u8>), Joined(Vec<u8>) }
@@ -67,6 +72,7 @@ struct State {
     join: Option<Join>,
     pending: HashMap<Id, Pend>,
     nack: HashMap<EndpointId, Instant>,       // rate limit for key-resync Hellos
+    seen: HashMap<Id, Instant>,               // non-push frame ids, until they leave the freshness window
     echo_until: HashMap<EndpointId, Instant>, // host: one outstanding echo per device
     via: HashMap<EndpointId, String>,         // relay each peer was last heard on
     down: HashMap<String, (Instant, Duration)>, // device: failing relays, skip until
@@ -78,7 +84,7 @@ struct State {
 impl State {
     fn new(d: Disk) -> Self {
         let dk = [DecapsulationKey::from(d.xw), DecapsulationKey::from(d.xw_prev)];
-        Self { d, dk, secrets: vec![], join: None, pending: HashMap::new(), nack: HashMap::new(), echo_until: HashMap::new(), via: HashMap::new(), down: HashMap::new(), net: 0, echoed: false, echo_alive: false }
+        Self { d, dk, secrets: vec![], join: None, pending: HashMap::new(), nack: HashMap::new(), seen: HashMap::new(), echo_until: HashMap::new(), via: HashMap::new(), down: HashMap::new(), net: 0, echoed: false, echo_alive: false }
     }
     fn id(&self) -> EndpointId { self.d.sk.public() }
     fn ek(&self) -> Vec<u8> { self.dk[0].encapsulation_key().to_bytes().to_vec() }
@@ -94,7 +100,7 @@ impl State {
     /// Device: preference order. Unpaired: only where the ticket's host listens.
     fn candidates(&self) -> Vec<Relay> {
         let app = self.d.app.iter().filter(|_| !self.hosts().is_empty()).cloned();
-        let all = relay::dedup(self.d.relays.iter().cloned().chain(app).chain([Relay::n0()])); // n0: always the last resort
+        let all = relay::dedup(self.d.relays.iter().cloned().chain(app).chain(relay::fallback(&self.d.relays))); // n0: the last resort
         let t = Instant::now();
         let up: Vec<_> = all.iter().filter(|r| self.down.get(&r.url).is_none_or(|d| d.0 <= t)).cloned().collect();
         if up.is_empty() { all } else { up }
@@ -105,7 +111,7 @@ impl State {
         let devices = self.d.peers.values().filter(|p| p.role == Role::Device).flat_map(|p| p.relays.iter().cloned());
         let mut l = relay::dedup(self.d.relays.iter().cloned().chain(devices));
         l.truncate(MAX_LISTEN);
-        relay::dedup(l.into_iter().chain([Relay::n0()]))
+        relay::dedup(l.into_iter().chain(relay::fallback(&self.d.relays)))
     }
 
     fn frame(&self, to: EndpointId, kind: Kind, id: &Id, app: &App, data: &[u8]) -> Result<Vec<u8>> {
@@ -279,6 +285,7 @@ impl Node {
     }
 
     /// Android: ConnectivityManager.NetworkCallback; iOS: NWPathMonitor (any stable id per network).
+    /// `OFFLINE` when there is no network: the device parks until the next call.
     pub fn network(&self, id: u64) { self.lock().net = id; self.reset.notify_waiters(); }
     /// Android: AlarmManager.setExactAndAllowWhileIdle (in-process timers stall during suspend).
     pub fn kick(&self) { self.kick.notify_one(); }
@@ -334,6 +341,13 @@ impl Node {
             Opened::Joined(pt) => self.on_pair_reply(&mut st, from, &pt),
             Opened::Peer(pt) => {
                 let m = proto::parse(&pt)?;
+                // Replay: pushes are de-duplicated by the delivered-id log; every other kind here
+                // (a relay may resend any frame inside the freshness window).
+                if m.kind != Kind::Push {
+                    let t = Instant::now();
+                    if st.seen.len() >= MAX_SEEN { st.seen.retain(|_, x| *x > t); }
+                    if st.seen.insert(m.id, t + Duration::from_secs(proto::MAX_AGE + proto::MAX_SKEW)).is_some_and(|x| x > t) { return Ok(()) }
+                }
                 let host = st.d.peers.get(&from).is_some_and(|p| p.role == Role::Host);
                 let mut r = Rd(m.data);
                 match m.kind {
@@ -498,8 +512,15 @@ impl Node {
     /// candidates in preference order on every reconnect; a failing relay is skipped with backoff.
     async fn relay_loop(&self, fixed: Option<String>, tlsc: &rustls::ClientConfig, dns: &DnsResolver, on: &impl Fn(EndpointId, App, &[u8])) -> String {
         let mut backoff = Duration::from_millis(250);
+        let idle = || self.paused.load(Relaxed) || (fixed.is_none() && self.lock().net == OFFLINE);
         loop {
-            while self.paused.load(Relaxed) { self.reset.notified().await; }
+            loop { // paused or offline: no radio use until the platform says otherwise
+                let w = self.reset.notified();
+                tokio::pin!(w);
+                w.as_mut().enable(); // registered before the check: no missed wakeup
+                if !idle() { break }
+                w.await;
+            }
             let (cands, sk) = {
                 let st = self.lock();
                 let c = match &fixed { Some(u) => st.listen().into_iter().filter(|r| &r.url == u).collect(), None => st.candidates() };
@@ -527,7 +548,7 @@ impl Node {
                     }
                 }
             }
-            if self.paused.load(Relaxed) { continue }
+            if idle() { continue }
             tokio::select! { _ = sleep(backoff) => {}, _ = self.kick.notified() => {}, _ = self.reset.notified() => {} }
             backoff = (backoff * 2).min(Duration::from_secs(300));
         }
@@ -549,6 +570,12 @@ impl Node {
     }
 
     async fn session_inner(&self, c: &mut Client, url: &str, rx: &mut mpsc::UnboundedReceiver<(EndpointId, Vec<u8>)>, on: &impl Fn(EndpointId, App, &[u8])) -> Result<()> {
+        // Registered once, before anything else: `notify_waiters` stores no permit, so a fresh
+        // future per loop pass would miss a network change or pause arriving mid-frame.
+        let reset = self.reset.notified();
+        tokio::pin!(reset);
+        reset.as_mut().enable();
+        if self.paused.load(Relaxed) || (self.role() == Role::Device && self.lock().net == OFFLINE) { bail!("paused or offline") } // changed while connecting
         let net = {
             let mut st = self.lock();
             self.rotate(&mut st)?;
@@ -630,7 +657,7 @@ impl Node {
                     retry = Instant::now() + Duration::from_secs(5);
                 }
                 _ = self.kick.notified() => if probe.is_none() { due = Instant::now() },
-                _ = self.reset.notified() => bail!("reconnect (network change or pause)"),
+                _ = &mut reset => bail!("reconnect (network change or pause)"),
             }
         }
     }
@@ -686,5 +713,8 @@ mod tests {
         assert_eq!(st.candidates().iter().map(|r| r.url.as_str()).collect::<Vec<_>>(), ["https://mesh.example/", N0]);
         d.role = Role::Host;
         assert_eq!(State::new(d).listen().last().unwrap().url, N0);
+        // `!n0` in the mesh relays: no fallback anywhere in the mesh
+        let own = Disk::new(Role::Device, Relay::list("https://mesh.example/,!n0").unwrap(), vec![]);
+        assert!(State::new(own).candidates().iter().all(|r| r.url != N0));
     }
 }

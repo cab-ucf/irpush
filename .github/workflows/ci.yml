@@ -1,0 +1,27 @@
+name: CI
+# Third-party actions pinned to commit SHAs; read-only token.
+on:
+  push: { branches: [main] }
+  pull_request:
+permissions: { contents: read }
+concurrency: { group: "${{ github.workflow }}-${{ github.ref }}", cancel-in-progress: true }
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with: { toolchain: stable, components: clippy }
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets --features ffi -- -D warnings
+      - run: cargo install cargo-audit --locked && cargo audit
+
+  ios: # the xcframework and the Swift package compile (no device run)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with: { toolchain: stable, targets: "aarch64-apple-ios,aarch64-apple-ios-sim" }
+      - run: make ios
+      - run: xcodebuild build -scheme Irpush -destination 'generic/platform=iOS'

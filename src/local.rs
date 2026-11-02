@@ -60,8 +60,8 @@ fn parse_apps(words: &[&str]) -> Result<HashSet<App>> {
     words.iter().map(|w| hex::decode(w)?.try_into().map_err(|_| anyhow::anyhow!("app: 16 bytes"))).collect()
 }
 
-/// Serve the socket forever. `allow(uid, apps)`: may this peer attach for these apps?
-/// `cmd(line, body)`: one-shot commands (the CLI); `Err` for none.
+/// Serve the socket forever. `allow(uid, apps)`: may this peer attach for these apps? With no apps:
+/// may it run one-shot commands? `cmd(line, body)`: those commands (the CLI); `Err` for none.
 pub async fn serve(node: Arc<Node>, local: Arc<Local>, l: UnixListener, allow: impl Fn(Option<u32>, &HashSet<App>) -> bool + Send + Sync + 'static,
     cmd: impl Fn(&Node, &str, Vec<u8>) -> Result<String> + Send + Sync + 'static) {
     let (allow, cmd) = (Arc::new(allow), Arc::new(cmd));
@@ -82,6 +82,7 @@ pub async fn serve(node: Arc<Node>, local: Arc<Local>, l: UnixListener, allow: i
                 while let Some(m) = rx.recv().await { if s.write_all(m.as_bytes()).await.is_err() { return } }
                 return;
             }
+            if !allow(uid, &HashSet::new()) { let _ = s.write_all(b"error: not allowed\n").await; return } // commands: owner's rule
             let mut body = vec![];
             if r.take(crate::BODY as u64 + 1).read_to_end(&mut body).await.is_err() { return }
             let out = cmd(&node, &line, body).unwrap_or_else(|e| format!("error: {e:#}\n"));

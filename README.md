@@ -60,6 +60,7 @@ infrastructure; one optional VPS improves Android battery and privacy.
 | A paired device | its own traffic | add members, revoke, change relays, impersonate hosts |
 | Holder of an unused ticket (10 min) | | pair as the role the ticket grants; treat tickets as secrets |
 | A host | everything of its mesh | (hosts are trusted infrastructure by design) |
+| Another irpush app on the phone | if it is the owner: every app's pushes on that phone | attach for an app id its uid's packages do not hash to |
 
 Forward secrecy: weekly X-Wing key rotation; a stolen device key exposes at most one epoch of
 frames *to that device*, and only together with the pairwise PSK. Endpoint ids are long-lived, so a
@@ -77,6 +78,7 @@ relay can link a device's sessions over time. Device-suggested relays must be `h
     irpush ~/.irpush id | peers | revoke ID
     irpush ~/.irpush attach org.example.chat org.example.mail   # stream these apps' pushes (any program)
     irpush ~/.irpush relays "https://a.example#TOKEN,https://b.example"   # later changes
+    irpush ~/.irpush relays "https://a.example#TOKEN,!n0"   # never fall back to n0 (whole mesh)
 
 Library: `Node::{create, join, open}`, `run(callback)`, `push`, `ticket`, `revoke`, `set_relays`,
 `set_route` / `set_apns_key` (iOS), `network` / `kick` / `pause` (platform hooks); `local::{bind,
@@ -120,7 +122,12 @@ keeps logs at warn level for 7 days, and can upgrade itself nightly (`autoUpgrad
 ## Battery
 One socket per phone; heartbeats up to 28 min (learned per network, persisted); any inbound traffic
 counts as a heartbeat; relay preference re-checked only on wakeups that happen anyway; failing relays
-backed off (5 min .. 6 h). On n0 (zero infrastructure) its 15 s server pings cost Android battery.
+backed off (5 min .. 6 h); no network (`network(OFFLINE)`) parks the device with no retries at all.
+On n0 (zero infrastructure) its 15 s server pings cost Android battery; `!n0` opts a mesh out.
+
+Replay: pushes are de-duplicated by a delivered-id log shared with the iOS extension (locked), every
+other frame kind by an in-memory id set over the 25 h freshness window. Long-lived secrets are wiped
+from memory when dropped.
 
 ## Tests
 `cargo test`: frame crypto (binding, tamper, freshness), state round trip, relay parsing, APNs JWT and
@@ -129,5 +136,11 @@ hosts, offline queue, revocation, identity and key guards), and the shared node 
 fall-through to the owner, refused attach, single owner).
 
 ## Limits
-Host queues live in memory (a host restart drops unacknowledged pushes). The protocol has not been
-formally verified or externally audited. The Swift and Xcode build have not been compiled here.
+Host queues live in memory (a host restart drops unacknowledged pushes, and replay protection for
+non-push frames restarts with them). The protocol has not been formally verified or externally
+audited; `x-wing` (draft-06) and `ml-kem` are unaudited crates, acceptable only because the
+construction is hybrid with X25519 and a pairwise PSK. CI compiles the Swift package; no device run
+is automated. The Android shell is specified above, not yet written. On Android the node's state
+belongs to the app that first became owner; uninstalling it means one re-pair.
+
+License: MIT OR Apache-2.0.

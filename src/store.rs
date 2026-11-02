@@ -5,6 +5,7 @@ use anyhow::{Context, Result, ensure};
 use chacha20poly1305::{XChaCha20Poly1305, aead::{Aead, KeyInit, Payload}};
 use iroh_base::{EndpointId, SecretKey};
 use std::{collections::HashMap, fs, io::Write, path::Path};
+use zeroize::Zeroize;
 use x_wing::{EncapsulationKey, kem::KeyExport};
 
 const VERSION: u8 = 8;
@@ -14,6 +15,9 @@ const AAD: &[u8] = b"irpush/state/8";
 #[repr(u8)]
 pub enum Role { Device = 0, Host = 1 }
 impl Role { pub(crate) fn of(b: u8) -> Self { if b == 1 { Role::Host } else { Role::Device } } }
+
+impl Drop for Peer { fn drop(&mut self) { self.psk.zeroize() } }
+impl Drop for Disk { fn drop(&mut self) { self.intro.zeroize(); self.xw.zeroize(); self.xw_prev.zeroize(); self.apns.zeroize() } }
 
 pub(crate) struct Peer {
     pub ek: EncapsulationKey,
@@ -99,9 +103,11 @@ pub(crate) fn save(path: &Path, kek: &[u8; 32], d: &Disk) -> Result<()> {
 /// Holds ids only (random), no content.
 pub(crate) fn first_delivery(path: &Path, id: &Id) -> Result<bool> {
     let p = path.with_extension("seen");
-    let b = fs::read(&p).unwrap_or_default();
+    let mut f = open_private(&p, true)?;
+    f.lock()?; // the app and its iOS extension race here: check-and-record is one step
+    let b = fs::read(&p)?;
     if b.as_chunks::<16>().0.contains(id) { return Ok(false) }
-    if b.len() >= 16 * 4096 { write_private(&p, &[&b[b.len() - 16 * 1023..], id].concat())?; } else { open_private(&p, true)?.write_all(id)?; }
+    if b.len() >= 16 * 4096 { write_private(&p, &[&b[b.len() - 16 * 1023..], id].concat())?; } else { f.write_all(id)?; }
     Ok(true)
 }
 

@@ -19,8 +19,8 @@ pub const BODY: usize = 1536;
 pub(crate) const HDR: usize = 1 + 16 + 16 + 8 + 2; // kind | msg id | app | unix time | len
 /// Frame size on the wire (2715 B).
 pub const FRAME: usize = CT + HDR + BODY + 16;
-const MAX_AGE: u64 = 25 * 3600; // APNs keeps a notification up to 24 h
-const MAX_SKEW: u64 = 3600;
+pub(crate) const MAX_AGE: u64 = 25 * 3600; // APNs keeps a notification up to 24 h
+pub(crate) const MAX_SKEW: u64 = 3600;
 
 /// App address on a device: hash of its stable name (bundle id / package name).
 pub type App = [u8; 16];

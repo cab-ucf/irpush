@@ -7,6 +7,9 @@ use iroh_base::RelayUrl;
 /// Frames stay end-to-end encrypted; n0 sees endpoint ids, IPs and timing. Its ~15 s pings cost
 /// Android battery while in use.
 pub const N0: &str = "https://use1-1.relay.n0.iroh.link./";
+/// In the mesh relays (`irpush DIR relays "https://you.example#T,!n0"`): never fall back to n0.
+/// Hosts propagate it to every member, so the whole mesh stays on its own infrastructure.
+pub const NO_N0: &str = "!n0";
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Relay { pub url: String, pub token: Option<[u8; 32]> }
@@ -14,6 +17,7 @@ pub struct Relay { pub url: String, pub token: Option<[u8; 32]> }
 impl Relay {
     pub fn parse(s: &str) -> Result<Self> {
         let s = s.trim();
+        if s == NO_N0 { return Ok(Self { url: NO_N0.into(), token: None }) }
         let (u, t) = s.split_once('#').map_or((s, None), |(u, t)| (u, Some(t)));
         let token = t.map(|t| -> Result<[u8; 32]> { hex::decode(t)?.try_into().map_err(|_| anyhow::anyhow!("token: 64 hex")) }).transpose()?;
         Ok(Self { url: u.parse::<RelayUrl>()?.to_string(), token })
@@ -35,6 +39,9 @@ impl Relay {
 
 pub fn is_n0(url: &str) -> bool { url == N0 }
 
+/// The n0 fallback unless the list opts out of it.
+pub(crate) fn fallback(l: &[Relay]) -> Option<Relay> { (!l.iter().any(|r| r.url == NO_N0)).then(Relay::n0) }
+
 pub(crate) fn dedup(l: impl IntoIterator<Item = Relay>) -> Vec<Relay> {
     let mut out: Vec<Relay> = vec![];
     for r in l { if !out.iter().any(|x| x.url == r.url) { out.push(r) } }
@@ -52,5 +59,8 @@ mod tests {
         assert!(l[1].public().is_err());
         assert!(Relay::parse("https://192.168.1.1/").unwrap().public().is_err());
         assert!(Relay::parse("https://a.example/#xyz").is_err());
+        let o = Relay::list("https://a.example/,!n0").unwrap();
+        assert!(fallback(&o).is_none() && fallback(&l).is_some() && o[1].public().is_err());
+        assert_eq!(Relay::list(&Relay::show(&o)).unwrap(), o);
     }
 }

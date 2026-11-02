@@ -95,7 +95,7 @@ pub unsafe extern "C" fn irp_serve(sock: *const c_char, auth: AuthCb, ctx: *mut 
     let (local, ctx) = (LOCAL.get_or_init(Default::default).clone(), Ctx(ctx));
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
-        rt.block_on(local::serve(n, local, l, move |uid, apps| uid.is_some_and(|u| apps.iter().all(|a| auth(ctx.get(), u, a.as_ptr()))), |_, _, _| anyhow::bail!("unknown command")));
+        rt.block_on(local::serve(n, local, l, move |uid, apps| !apps.is_empty() && uid.is_some_and(|u| apps.iter().all(|a| auth(ctx.get(), u, a.as_ptr()))), |_, _, _| anyhow::bail!("unknown command")));
     });
     0
 }
@@ -114,6 +114,7 @@ pub unsafe extern "C" fn irp_attach(sock: *const c_char, apps: *const u8, n: usi
 }
 
 #[unsafe(no_mangle)] pub extern "C" fn irp_pause(p: bool) { if let Some(n) = NODE.get() { n.pause(p) } }
+/// Stable id of the current network; `u64::MAX` = offline (the device parks).
 #[unsafe(no_mangle)] pub extern "C" fn irp_network(id: u64) { if let Some(n) = NODE.get() { n.network(id) } }
 #[unsafe(no_mangle)] pub extern "C" fn irp_kick() { if let Some(n) = NODE.get() { n.kick() } }
 

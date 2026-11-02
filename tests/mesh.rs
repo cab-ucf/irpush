@@ -74,6 +74,14 @@ async fn mesh() {
     h2.push(id, &a, b"from h2").unwrap();
     assert_eq!(recv(&mut drx).await.2, b"from h2");
 
+    // No network: the device parks (no reconnect attempts); pushes queue on the host meanwhile.
+    dev.network(irpush::OFFLINE);
+    until(|| dev.relay_watch().borrow().is_none()).await;
+    h1.push(id, &a, b"while parked").unwrap();
+    assert!(timeout(Duration::from_secs(2), drx.recv()).await.is_err(), "parked: nothing arrives");
+    dev.network(1);
+    assert_eq!(recv(&mut drx).await.2, b"while parked");
+
     // Offline: queued on the host, delivered when the device comes back.
     dt.abort();
     drop(dev);
