@@ -15,6 +15,8 @@
 mod apns;
 #[cfg(feature = "ffi")]
 pub mod ffi;
+#[cfg(feature = "jni")]
+mod jni;
 pub mod local;
 mod proto;
 mod relay;

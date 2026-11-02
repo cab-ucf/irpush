@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Merged into every app that uses irpush: nothing to declare by hand. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Find the other irpush apps on the phone (package visibility). -->
+    <queries>
+        <intent><action android:name="org.irpush.ATTACH" /></intent>
+    </queries>
+
+    <application>
+        <service
+            android:name="org.irpush.Broker"
+            android:exported="true"
+            android:foregroundServiceType="remoteMessaging">
+            <intent-filter><action android:name="org.irpush.ATTACH" /></intent-filter>
+        </service>
+        <receiver android:name="org.irpush.Alarm" android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+        <!-- Carries no data: it only makes the app attach and fetch. -->
+        <receiver android:name="org.irpush.Wake" android:exported="true">
+            <intent-filter><action android:name="org.irpush.WAKE" /></intent-filter>
+        </receiver>
+    </application>
+</manifest>
