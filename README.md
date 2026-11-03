@@ -67,7 +67,8 @@ infrastructure; one optional VPS improves Android battery and privacy.
 | Holder of an unused ticket (10 min) | | pair as the role the ticket grants; treat tickets as secrets |
 | A host | everything of its mesh | (hosts are trusted infrastructure by design) |
 | A revoked host (even with a relay lying about senders) | | forge frames between members it introduced, once they mixed their PSK |
-| Another irpush app on the phone | if it is the owner: every app's pushes on that phone | attach for an app id its uid's packages do not hash to |
+| Another irpush app on the phone, signed by the same key | if it is the owner: every app's pushes of the group | attach for an app id its uid's packages do not hash to |
+| An app signed by another key | | attach, wake an app, or become an app's owner |
 
 Forward secrecy: weekly X-Wing key rotation; a stolen device key exposes at most one epoch of
 frames *to that device*, and only together with the pairwise PSK. Endpoint ids are long-lived, so a
@@ -97,14 +98,20 @@ native library (one Rust runtime per app). Include it with the app's own Gradle 
 
     // settings: include(":irpush"); project(":irpush").projectDir = file("irpush/android/irpush")
     // app: implementation(project(":irpush"))      Cargo: irpush = { ..., features = ["jni"] }
+    // app defaultConfig: manifestPlaceholders["irpushGroup"] = "com.example"   // your apps' group
     class App : Application() { override fun onCreate() { super.onCreate()
         Irpush.start(this, "mylib", onId = { id -> }) { from, data -> /* a push for this package */ } } }
     Irpush.join(ticket) { ok -> }   // a host's ticket; also into a second mesh (below)
 
-Its manifest brings the service, receivers and permissions. Every app that includes it can be the
-phone's one node; the rest share it:
-- **Election**: the irpush app installed first (`firstInstallTime`, then package name) owns the node;
-  every app computes the same answer from `queryIntentServices(org.irpush.ATTACH)`. No lock, no race.
+Its manifest brings the service, receivers and permissions. The apps of one group, signed by one key,
+share one node, which any of them can run:
+- **Group**: the `signature` permission `<irpushGroup>.permission.IRPUSH` guards the exported `Broker`
+  and `Wake`, so only apps signed by the same key attach or wake. The name comes from the app
+  (`irpushGroup`): a fixed name would let the first app to define it, signed by any key, block every
+  other irpush app's install (`INSTALL_FAILED_DUPLICATE_PERMISSION`).
+- **Election**: the app of the group installed first (`firstInstallTime`, then package name) owns the
+  node; every app computes the same answer from `queryIntentServices(org.irpush.ATTACH)`, keeping the
+  apps signed by its own key, so no other app can pose as owner. No lock, no race.
 - **Broker**: apps bind the owner's `Broker` service (Binder, `Messenger`). The owner authenticates each
   message by its kernel-supplied `sendingUid`: an app receives only the pushes for its own packages
   (`irp_app(package)`). A push for an app that is not attached is held (64 per app, in memory) and the
@@ -187,10 +194,11 @@ non-push frames restarts with them). The protocol has not been formally verified
 audited; `x-wing` (draft-06) and `ml-kem` are unaudited crates, acceptable only because the
 construction is hybrid with X25519 and a pairwise PSK. CI compiles the Swift package; no device run
 is automated; the Android library is built in CI, not run on a device. On Android the node's state
-belongs to the owner app; uninstalling it means one re-pair. Any app on the phone can include the
-library, so the first one installed owns everyone's pushes (the threat model's "another irpush app";
-keep payloads to what a wake-up needs), and any of them can join it to more meshes, whose hosts can
-then push to every app on the phone: treat a push as an untrusted wake-up (`from` names its host).
+belongs to the owner app; uninstalling it means one re-pair. The first app of a group installed owns
+the group's pushes (the threat model's "another irpush app"; keep payloads to what a wake-up needs),
+and any of them can join it to more meshes, whose hosts can then push to every app of the group:
+treat a push as an untrusted wake-up (`from` names its host). Messages missing their extras are
+ignored.
 Joined meshes' hosts learn the relays the device uses, relay tokens included.
 
 ## Prior art
