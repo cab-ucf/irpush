@@ -1,0 +1,34 @@
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -581,8 +581,7 @@
+     // a default provider.
+     // `ring` is enabled by the `tls-ring` feature, which is included in the `server` feature,
+     // which is required for the main.rs binary. Therefore, this does not need any feature flags.
+-    rustls::crypto::ring::default_provider()
+-        .install_default()
++    pq().install_default()
+         .expect("failed to set default crypto provider");
+ 
+     let cli = Cli::parse();
+@@ -617,12 +616,17 @@
+     Ok(())
+ }
+ 
++/// irpush: aws-lc-rs, X25519MLKEM768 first (a server picks by its own order), so clients that
++/// offer the hybrid get it; ring has no post-quantum key exchange.
++fn pq() -> rustls::crypto::CryptoProvider {
++    use rustls::crypto::aws_lc_rs::{default_provider, kx_group::{SECP256R1, SECP384R1, X25519, X25519MLKEM768}};
++    rustls::crypto::CryptoProvider { kx_groups: vec![X25519MLKEM768, X25519, SECP256R1, SECP384R1], ..default_provider() }
++}
++
+ async fn load_cert_config(tls: &TlsConfig) -> Result<relay::CertConfig> {
+-    let server_config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+-        rustls::crypto::ring::default_provider(),
+-    ))
++    let server_config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(pq()))
+     .with_safe_default_protocol_versions()
+-    .expect("protocols supported by ring")
++    .expect("protocols supported by aws-lc-rs")
+     .with_no_client_auth();
+     let cert_config = match tls.cert_mode {
+         CertMode::Manual => {
