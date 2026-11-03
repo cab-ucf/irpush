@@ -56,6 +56,8 @@ infrastructure; one optional VPS improves Android battery and privacy.
   forge frames between them. Pairs with a peer older than this keep the given PSK. State at rest: one XChaCha20-Poly1305 file under a platform key.
 - **Relay hop**: TLS 1.3 with X25519MLKEM768 key exchange (rustls, aws-lc-rs provider), so the
   metadata the relay hop carries (endpoint ids, tokens) is not harvest-now-decrypt-later exposed either.
+  Only on irpush's relay build (`deploy/relay-pq.patch`): stock iroh relays, n0's included, use ring and
+  settle on classical X25519. Frames are post-quantum end to end either way.
 
 ## Threat model
 | Party | Sees | Cannot |
