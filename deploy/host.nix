@@ -12,7 +12,7 @@ let c = import ./config.nix; in {
   };
   users.users.root.openssh.authorizedKeys.keys = c.sshKeys;
 
-  services.irpushRelays = { enable = true; inherit (c) irohDomain irpushDomain email; };
+  services.irpushRelays = { enable = true; inherit (c) irohDomain irpushDomain email requireToken; };
 
   environment.systemPackages = [ pkgs.openssl ];
   services.journald.extraConfig = "MaxRetentionSec=7day"; # privacy: short log retention

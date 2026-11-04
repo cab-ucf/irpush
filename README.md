@@ -139,16 +139,19 @@ Info.plist (both): `IrpushGroup = group.your.app`; app, optional: `IrpushRelays 
 
 ## Your own relay (optional VPS)
 `irpush.<you>` is iroh's relay with one change: it pings a client only after 130 min of silence
-instead of every 15 s, so phones drive their own learned heartbeats (up to 2 h). It is token-gated
-and rate-limited: bytes per connection (iroh-relay), new connections (nftables) and open ones
-(nginx) per source IP; sockets idle for 135 min are closed. The token embedded in an app is not a
-secret: it keeps strangers off the relay, and the limits bound what a holder can use. A stock `iroh.<you>` relay can share the box (`irohDomain`), routed by SNI on :443.
+instead of every 15 s, so phones drive their own learned heartbeats (up to 2 h). It is open by
+default: anyone may connect, so every device homed on it is reachable by everyone, and the limits
+bound abuse: bytes per connection (iroh-relay), new connections (nftables) and open ones (nginx) per
+source IP; sockets idle for 135 min are closed. `requireToken = true` admits token holders only: abuse
+control, not privacy (frames are sealed end to end either way), and whoever lacks the token cannot
+reach a device homed there. A stock `iroh.<you>` relay can share the box (`irohDomain`), routed by SNI on :443.
 
 On DigitalOcean (the smallest droplet that installs is 2 GB; Hetzner works too):
 1. Create an Ubuntu droplet with an SSH key used only for it. Add an A record `irpush.<you>` -> its IP.
 2. In `deploy/config.nix`, set your domain, email and that SSH public key.
 3. `make deploy HOST=<ip>`: nixos-anywhere replaces Ubuntu with NixOS, built on the droplet.
-4. `make token HOST=<ip>`: prints the token. Use `https://irpush.<you>#TOKEN` as your app's relay or
+4. With `requireToken`, `make token HOST=<ip>` prints the token. Use `https://irpush.<you>#TOKEN`
+   (open: `https://irpush.<you>`) as your app's relay or
    `irpush DIR relays ...` for a mesh. An irch storage node reads it from a root-only file outside
    the Nix store (`services.irch.pushRelayFile`, e.g. via agenix or sops-nix).
 

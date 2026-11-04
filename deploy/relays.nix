@@ -57,8 +57,8 @@ let
       contact = cfg.email;
       cert_dir = "/var/lib/irpush-relay";
     };
-    # pushes are tiny; this bounds what anyone holding the (app-embedded) token can take per connection
-    limits.client.rx = { bytes_per_second = 65536; max_burst_bytes = 1048576; };
+    # what one client can take: a relayed call fits, a flood does not
+    limits.client.rx = { bytes_per_second = 4194304; max_burst_bytes = 16777216; };
   };
 in {
   options.services.irpushRelays = {
@@ -66,6 +66,9 @@ in {
     irohDomain = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; }; # null: irpush only
     irpushDomain = lib.mkOption { type = lib.types.str; };
     email = lib.mkOption { type = lib.types.str; };
+    # Off: anyone may connect, so every device homed here is reachable by everyone (limits bound abuse).
+    # On: only token holders; whoever lacks it cannot reach those homed here. Abuse control, not privacy.
+    requireToken = lib.mkOption { type = lib.types.bool; default = false; };
   };
 
   config = lib.mkIf cfg.enable {
@@ -83,17 +86,17 @@ in {
       };
     };
 
-    # Tokens: /var/lib/irpush-relay/tokens, one per line (several during rotation). Never in the store.
+    # requireToken: /var/lib/irpush-relay/tokens, one per line (several during rotation). Never in the store.
     systemd.services.irpush-relay = {
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
       path = [ pkgs.openssl pkgs.coreutils pkgs.gnused ];
-      preStart = ''
+      preStart = if cfg.requireToken then ''
         t=$STATE_DIRECTORY/tokens
         [ -s "$t" ] || { umask 077; openssl rand -hex 32 > "$t"; }
         { cat ${pushConf}; printf '\n[access]\nshared_token = [%s]\n' "$(sed 's/.*/"&"/' "$t" | paste -sd, -)"; } > "$RUNTIME_DIRECTORY/relay.toml"
-      '';
+      '' else "cp ${pushConf} $RUNTIME_DIRECTORY/relay.toml";
       serviceConfig = hardened // {
         StateDirectory = "irpush-relay";
         StateDirectoryMode = "0700";
