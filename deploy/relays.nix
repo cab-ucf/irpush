@@ -58,7 +58,7 @@ let
       contact = cfg.email;
       cert_dir = "/var/lib/irpush-relay";
     } // lib.optionalAttrs (!iroh) { quic_bind_addr = "0.0.0.0:7842"; };
-    # what one client can take: a relayed call fits, a flood does not
+    # what one client can take: a relayed call fits, a flood does not (keys in /var/lib/irpush-relay/keys: no limit)
     limits.client.rx = { bytes_per_second = 4194304; max_burst_bytes = 16777216; };
   };
 in {
@@ -94,6 +94,7 @@ in {
         StateDirectoryMode = "0700";
         WorkingDirectory = "/var/lib/irpush-relay";
         CapabilityBoundingSet = [ "" ];
+        Environment = [ "RUST_LOG=warn" "RELAY_KEYS=/var/lib/irpush-relay/keys" ];
         ExecStart = "${pkg.irpush-relay}/bin/iroh-relay --config-path ${pushConf}";
         LimitNOFILE = 16384;
       };

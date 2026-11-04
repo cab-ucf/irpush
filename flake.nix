@@ -35,8 +35,10 @@
         };
         iroh-relay = relay pkgs "iroh-relay" [ ] [ ];                                # stock: iroh data relay
         # server ping after 130 min of client silence (clients drive heartbeats); TLS by aws-lc-rs with
-        # X25519MLKEM768 first, so the relay hop is post-quantum (stock iroh-relay: ring, X25519 only)
-        irpush-relay = relay pkgs "irpush-relay" [ ./deploy/relay-ping.patch ./deploy/relay-pq.patch ] [ "tls-aws-lc-rs" ];
+        # X25519MLKEM768 first, so the relay hop is post-quantum (stock iroh-relay: ring, X25519 only);
+        # a key in $RELAY_KEYS lifts the rate limit (big transfers that cannot go direct)
+        irpush-relay = relay pkgs "irpush-relay"
+          [ ./deploy/relay-ping.patch ./deploy/relay-pq.patch ./deploy/relay-unlimited.patch ] [ "tls-aws-lc-rs" ];
       });
 
       nixosModules.relays = import ./deploy/relays.nix self;

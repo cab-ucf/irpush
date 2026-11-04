@@ -142,7 +142,9 @@ Info.plist (both): `IrpushGroup = group.your.app`; app, optional: `IrpushRelays 
 instead of every 15 s, so phones drive their own learned heartbeats (up to 2 h). It is open:
 anyone may connect, so every device homed on it is reachable by everyone, and the limits
 bound abuse: bytes per connection (iroh-relay), new connections (nftables) and open ones (nginx) per
-source IP; sockets idle for 135 min are closed. A stock `iroh.<you>` relay can share the box (`irohDomain`), routed by SNI on :443.
+source IP; sockets idle for 135 min are closed. Direct paths are never limited; for transfers that
+cannot go direct, `make key HOST=<ip>` makes a key that lifts the rate limit (`url#key` in the app;
+`make keys` lists them, delete a line to revoke). A stock `iroh.<you>` relay can share the box (`irohDomain`), routed by SNI on :443.
 
 On DigitalOcean (the smallest droplet that installs is 2 GB; Hetzner works too):
 1. Create an Ubuntu droplet with an SSH key used only for it. Add an A record `irpush.<you>` -> its IP.

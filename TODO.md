@@ -6,6 +6,7 @@ irch's plan (the why): irch's PLAN.md.
 - [x] No token: anyone may connect, so every device homed here is
       reachable by everyone; limits, per-IP caps and idle timeouts bound abuse
 - [x] Per-client rate fit for relayed calls (direct paths have no limit)
+- [x] Keys lift it (`make key`): a lab's terabytes through its own relay
 - [x] QUIC address discovery, so devices homed here find direct paths
 - [ ] Deploy (`make update HOST=…`)
 - [ ] One relay for everything: serve the stock name too, drop the second

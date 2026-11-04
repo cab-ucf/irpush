@@ -1,0 +1,41 @@
+--- a/src/server/http_server.rs
++++ b/src/server/http_server.rs
+@@ -853,8 +853,14 @@
+         // Set the socket to NO_DELAY.
+         io.disable_nagle();
+ 
+-        let io = RateLimited::from_watcher(io, self.rate_limit.subscribe(), self.metrics.clone())
+-            .map_err(|err| e!(AcceptError::RateLimitingMisconfigured, err))?;
++        // irpush: a key in $RELAY_KEYS (a file, one per line) lifts the rate limit, for big transfers
++        // that cannot go direct. Everyone else keeps the fair share.
++        let io = if unlimited(&request_parts) {
++            RateLimited::unlimited(io, self.metrics.clone())
++        } else {
++            RateLimited::from_watcher(io, self.rate_limit.subscribe(), self.metrics.clone())
++                .map_err(|err| e!(AcceptError::RateLimitingMisconfigured, err))?
++        };
+         let limited_watcher = io.limited_watcher();
+ 
+         // Create a server builder with default config
+@@ -1809,3 +1815,11 @@
+         Ok(())
+     }
+ }
++
++/// irpush: whether the client's bearer key is one of `$RELAY_KEYS`'s lines.
++fn unlimited(req: &http::request::Parts) -> bool {
++    let Some(path) = std::env::var_os("RELAY_KEYS") else { return false };
++    let Some(key) = req.headers.get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else { return false };
++    let Some(key) = key.strip_prefix("Bearer ").filter(|k| k.len() >= 32) else { return false };
++    std::fs::read_to_string(path).is_ok_and(|f| f.lines().any(|l| l.trim() == key))
++}
+--- a/src/server/streams.rs
++++ b/src/server/streams.rs
+@@ -521,7 +521,6 @@
+         })
+     }
+ 
+-    #[cfg(test)]
+     pub(crate) fn unlimited(inner: S, metrics: Arc<Metrics>) -> Self {
+         Self {
+             inner,
