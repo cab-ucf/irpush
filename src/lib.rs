@@ -5,7 +5,7 @@
 //! - Hosts (always-on desktops) are the servers: they queue, introduce members, revoke, and post to
 //!   APNs directly for iOS. Desktops listen on every candidate relay; phones never probe.
 //! - Every frame is fixed-size and sealed end to end with X-Wing (ML-KEM-768 + X25519) + a pairwise
-//!   PSK. Relays and Apple see ids/tokens, IPs and timing; never content, app, kind or length.
+//!   PSK. Relays and Apple see ids (Apple: tokens), IPs and timing; never content, app, kind or length.
 //! - One node per phone: the first app binds the local socket and runs it, later apps attach over it
 //!   (`local`). iOS cannot share a socket across apps; its apps share the identity (App Group) and
 //!   each has its own APNs route.
@@ -30,7 +30,7 @@ pub use proto::{App, BODY, FRAME, app};
 pub use relay::{N0, NO_N0, Relay, is_n0};
 pub use store::{Role, write_private};
 
-/// 32 random bytes from the OS (KEKs, relay tokens).
+/// 32 random bytes from the OS (KEKs).
 pub fn random32() -> [u8; 32] { rnd() }
 
 use anyhow::{Context, Result, bail, ensure};
@@ -319,8 +319,8 @@ impl Node {
         self.apply_revoke(id)
     }
 
-    /// Set the mesh's own relays (preference order, tokens included). Sent sealed to every member;
-    /// offline ones get it on their next Hello; devices switch on their next connect. Also token rotation.
+    /// Set the mesh's own relays (preference order). Sent sealed to every member;
+    /// offline ones get it on their next Hello; devices switch on their next connect.
     pub fn set_relays(&self, l: Vec<Relay>) -> Result<()> {
         let mut st = self.lock();
         ensure!(st.d.role == Role::Host, "only hosts set the mesh relays");
@@ -632,8 +632,7 @@ impl Node {
             if cands.is_empty() { return fixed.unwrap_or_default() }
             for r in cands {
                 let Ok(url) = r.url.parse::<RelayUrl>() else { continue };
-                let mut b = ClientBuilder::new(url, sk.clone(), dns.clone()).tls_client_config(tlsc.clone());
-                if let Some(t) = r.token { b = b.auth_token(hex::encode(t)); }
+                let b = ClientBuilder::new(url, sk.clone(), dns.clone()).tls_client_config(tlsc.clone());
                 match timeout(Duration::from_secs(8), b.connect()).await {
                     Ok(Ok(c)) => {
                         self.lock().down.remove(&r.url);

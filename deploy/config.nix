@@ -2,7 +2,6 @@
 # before `make deploy`.
 {
   irpushDomain = "irpush.cxn.center"; # irpush relay: long heartbeats
-  requireToken = false;               # true: token holders only, the rest cannot reach them
   irohDomain = null;                  # e.g. "iroh.cxn.center" to run a stock iroh relay here too
   email = "admin@cxn.center";         # Let's Encrypt contact
   system = "x86_64-linux";            # Hetzner ARM (CAX): "aarch64-linux"

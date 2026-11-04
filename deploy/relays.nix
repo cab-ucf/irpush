@@ -46,9 +46,10 @@ let
     };
     limits.client.rx = { bytes_per_second = 4194304; max_burst_bytes = 16777216; };
   };
-  pushConf = toml.generate "irpush-relay-base.toml" {
+  pushConf = toml.generate "irpush-relay.toml" {
     http_bind_addr = "127.0.0.1:8082";
-    enable_quic_addr_discovery = false;
+    # devices learn their public address here (for direct paths), unless a stock relay holds the port
+    enable_quic_addr_discovery = !iroh;
     enable_metrics = false;
     tls = {
       https_bind_addr = "127.0.0.1:8442";
@@ -56,7 +57,7 @@ let
       cert_mode = "LetsEncrypt";
       contact = cfg.email;
       cert_dir = "/var/lib/irpush-relay";
-    };
+    } // lib.optionalAttrs (!iroh) { quic_bind_addr = "0.0.0.0:7842"; };
     # what one client can take: a relayed call fits, a flood does not
     limits.client.rx = { bytes_per_second = 4194304; max_burst_bytes = 16777216; };
   };
@@ -66,9 +67,6 @@ in {
     irohDomain = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; }; # null: irpush only
     irpushDomain = lib.mkOption { type = lib.types.str; };
     email = lib.mkOption { type = lib.types.str; };
-    # Off: anyone may connect, so every device homed here is reachable by everyone (limits bound abuse).
-    # On: only token holders; whoever lacks it cannot reach those homed here. Abuse control, not privacy.
-    requireToken = lib.mkOption { type = lib.types.bool; default = false; };
   };
 
   config = lib.mkIf cfg.enable {
@@ -86,25 +84,17 @@ in {
       };
     };
 
-    # requireToken: /var/lib/irpush-relay/tokens, one per line (several during rotation). Never in the store.
+    # Open: anyone may connect, so every device homed here is reachable by everyone; limits bound abuse.
     systemd.services.irpush-relay = {
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
-      path = [ pkgs.openssl pkgs.coreutils pkgs.gnused ];
-      preStart = if cfg.requireToken then ''
-        t=$STATE_DIRECTORY/tokens
-        [ -s "$t" ] || { umask 077; openssl rand -hex 32 > "$t"; }
-        { cat ${pushConf}; printf '\n[access]\nshared_token = [%s]\n' "$(sed 's/.*/"&"/' "$t" | paste -sd, -)"; } > "$RUNTIME_DIRECTORY/relay.toml"
-      '' else "cp ${pushConf} $RUNTIME_DIRECTORY/relay.toml";
       serviceConfig = hardened // {
         StateDirectory = "irpush-relay";
         StateDirectoryMode = "0700";
-        RuntimeDirectory = "irpush-relay";
-        RuntimeDirectoryMode = "0700";
         WorkingDirectory = "/var/lib/irpush-relay";
         CapabilityBoundingSet = [ "" ];
-        ExecStart = "${pkg.irpush-relay}/bin/iroh-relay --config-path /run/irpush-relay/relay.toml";
+        ExecStart = "${pkg.irpush-relay}/bin/iroh-relay --config-path ${pushConf}";
         LimitNOFILE = 16384;
       };
     };
@@ -158,7 +148,7 @@ in {
         '';
       };
     };
-    networking.firewall = { allowedTCPPorts = [ 22 443 ] ++ lib.optional iroh 80; allowedUDPPorts = lib.optional iroh 7842; };
+    networking.firewall = { allowedTCPPorts = [ 22 443 ] ++ lib.optional iroh 80; allowedUDPPorts = [ 7842 ]; };
 
     boot.kernel.sysctl = {
       "net.ipv4.tcp_mtu_probing" = 1; # recover from black holes the clamp cannot cover (e.g. WireGuard in WireGuard)

@@ -55,7 +55,7 @@ infrastructure; one optional VPS improves Android battery and privacy.
   X-Wing key (`Key` frames), so neither that host (even once revoked) nor a ticket's holder can
   forge frames between them. Pairs with a peer older than this keep the given PSK. State at rest: one XChaCha20-Poly1305 file under a platform key.
 - **Relay hop**: TLS 1.3 with X25519MLKEM768 key exchange (rustls, aws-lc-rs provider), so the
-  metadata the relay hop carries (endpoint ids, tokens) is not harvest-now-decrypt-later exposed either.
+  metadata the relay hop carries (endpoint ids) is not harvest-now-decrypt-later exposed either.
   Only on irpush's relay build (`deploy/relay-pq.patch`): stock iroh relays, n0's included, use ring and
   settle on classical X25519. Frames are post-quantum end to end either way.
 
@@ -78,7 +78,7 @@ relay can link a device's sessions over time. Device-suggested relays must be `h
 
 ## Use
     irpush ~/.irpush create                                  # first host (zero infrastructure)
-    irpush ~/.irpush create "https://irpush.you.example#TOKEN"   # ... or preferring your relay
+    irpush ~/.irpush create "https://irpush.you.example"   # ... or preferring your relay
     irpush ~/.irpush run &                                   # as a service (systemd)
     irpush ~/.irpush ticket host | qrencode -t ansiutf8      # add a host
     irpush ~/.irpush ticket                                  # add a device (in-band or QR)
@@ -86,8 +86,8 @@ relay can link a device's sessions over time. Device-suggested relays must be `h
     echo hi | irpush ~/.irpush push DEVICE_ID org.example.chat   # <= 1536 B
     irpush ~/.irpush id | peers | revoke ID
     irpush ~/.irpush attach org.example.chat org.example.mail   # stream these apps' pushes (any program)
-    irpush ~/.irpush relays "https://a.example#TOKEN,https://b.example"   # later changes
-    irpush ~/.irpush relays "https://a.example#TOKEN,!n0"   # never fall back to n0 (whole mesh)
+    irpush ~/.irpush relays "https://a.example,https://b.example"   # later changes
+    irpush ~/.irpush relays "https://a.example,!n0"   # never fall back to n0 (whole mesh)
 
 Library: `Node::{create, join, open}`, `run(callback)`, `push`, `ticket`, `revoke`, `set_relays`,
 `set_route` / `set_apns_key` (iOS), `network` / `kick` / `pause` (platform hooks); `local::{bind,
@@ -129,7 +129,7 @@ phone's one node; the rest share it:
 Host, once: `irpush ~/.irpush apns KEYID TEAMID < AuthKey_KEYID.p8` (one key covers your apps).
 `make ios` (macOS + Xcode) builds `Irpush.xcframework`; add this repo as a Swift package.
 App and extension: App Groups + Keychain Sharing (same group), Push Notifications on the app.
-Info.plist (both): `IrpushGroup = group.your.app`; app, optional: `IrpushRelays = https://irpush.you.example#TOKEN`.
+Info.plist (both): `IrpushGroup = group.your.app`; app, optional: `IrpushRelays = https://irpush.you.example`.
 
     Irpush.start(ticket: firstRunTicket) { from, app, data in DispatchQueue.main.async { /* deliver */ } }
     func application(_: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken t: Data) { Irpush.register(apnsToken: t) }
@@ -139,25 +139,20 @@ Info.plist (both): `IrpushGroup = group.your.app`; app, optional: `IrpushRelays 
 
 ## Your own relay (optional VPS)
 `irpush.<you>` is iroh's relay with one change: it pings a client only after 130 min of silence
-instead of every 15 s, so phones drive their own learned heartbeats (up to 2 h). It is open by
-default: anyone may connect, so every device homed on it is reachable by everyone, and the limits
+instead of every 15 s, so phones drive their own learned heartbeats (up to 2 h). It is open:
+anyone may connect, so every device homed on it is reachable by everyone, and the limits
 bound abuse: bytes per connection (iroh-relay), new connections (nftables) and open ones (nginx) per
-source IP; sockets idle for 135 min are closed. `requireToken = true` admits token holders only: abuse
-control, not privacy (frames are sealed end to end either way), and whoever lacks the token cannot
-reach a device homed there. A stock `iroh.<you>` relay can share the box (`irohDomain`), routed by SNI on :443.
+source IP; sockets idle for 135 min are closed. A stock `iroh.<you>` relay can share the box (`irohDomain`), routed by SNI on :443.
 
 On DigitalOcean (the smallest droplet that installs is 2 GB; Hetzner works too):
 1. Create an Ubuntu droplet with an SSH key used only for it. Add an A record `irpush.<you>` -> its IP.
 2. In `deploy/config.nix`, set your domain, email and that SSH public key.
 3. `make deploy HOST=<ip>`: nixos-anywhere replaces Ubuntu with NixOS, built on the droplet.
-4. With `requireToken`, `make token HOST=<ip>` prints the token. Use `https://irpush.<you>#TOKEN`
-   (open: `https://irpush.<you>`) as your app's relay or
-   `irpush DIR relays ...` for a mesh. An irch storage node reads it from a root-only file outside
-   the Nix store (`services.irch.pushRelayFile`, e.g. via agenix or sops-nix).
+4. Use `https://irpush.<you>` as your app's relay or
+   `irpush DIR relays ...` for a mesh (an irch storage node: `services.irch.pushRelayFile`).
 
 Later: `make update HOST=<ip>` applies changes; `make bump` moves the pinned nixpkgs and disko first.
-Rotate after a revoke: `make token-add`, `irpush DIR relays "https://irpush.<you>#NEW"`, then after a
-grace period `make token-drop`. The VPS clamps TCP MSS to 1120 (fits WireGuard on a 1280-byte path),
+The VPS clamps TCP MSS to 1120 (fits WireGuard on a 1280-byte path),
 keeps logs at warn level for 7 days, and can upgrade itself nightly (`autoUpgrade`).
 
 ## Battery
@@ -196,7 +191,7 @@ belongs to the owner app; uninstalling it means one re-pair. Any app on the phon
 library, so the first one installed owns everyone's pushes (the threat model's "another irpush app";
 keep payloads to what a wake-up needs), and any of them can join it to more meshes, whose hosts can
 then push to every app on the phone: treat a push as an untrusted wake-up (`from` names its host).
-Joined meshes' hosts learn the relays the device uses, relay tokens included.
+Joined meshes' hosts learn the relays the device uses.
 
 ## Prior art
 UnifiedPush already gives Android one connection that all apps share, and FCM learns heartbeats

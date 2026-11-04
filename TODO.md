@@ -3,12 +3,15 @@
 irch's plan (the why): irch's PLAN.md.
 
 ## Relay: reachable by anyone
-- [x] Open by default: the token is an option (`requireToken`), abuse
-      bounded by rate limits, per-IP connection caps and idle timeouts
-- [x] Per-client rate limit fit for relayed calls, not only pushes
-- [ ] Deploy (`make update HOST=…`), then irch homes on it everywhere
-- [ ] Optional "home token": anyone may send to devices homed here, only
-      holders may home (a patch to iroh-relay's send path)
+- [x] No token: anyone may connect, so every device homed here is
+      reachable by everyone; limits, per-IP caps and idle timeouts bound abuse
+- [x] Per-client rate fit for relayed calls (direct paths have no limit)
+- [x] QUIC address discovery, so devices homed here find direct paths
+- [ ] Deploy (`make update HOST=…`)
+- [ ] One relay for everything: serve the stock name too, drop the second
+- [ ] Deploy from the app: a VPS provider's API token in, a relay out
+      (cloud-init, a signed static binary, an IP certificate or the
+      provider's DNS); or a storage node with a public address serves one
 
 ## One socket per device
 - [ ] Desktops: irch's iroh endpoint and irpush's device on one relay

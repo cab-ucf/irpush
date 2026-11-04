@@ -1,4 +1,4 @@
-//! Push relay addresses: `url` or `url#hex-token` (token: the relay's `access.shared_token`).
+//! Push relay addresses: `url` (an older `url#token` is read as `url`: relays are open).
 use crate::proto::{Rd, lp};
 use anyhow::{Result, ensure};
 use iroh_base::RelayUrl;
@@ -7,25 +7,24 @@ use iroh_base::RelayUrl;
 /// Frames stay end-to-end encrypted; n0 sees endpoint ids, IPs and timing. Its ~15 s pings cost
 /// Android battery while in use.
 pub const N0: &str = "https://use1-1.relay.n0.iroh.link./";
-/// In the mesh relays (`irpush DIR relays "https://you.example#T,!n0"`): never fall back to n0.
+/// In the mesh relays (`irpush DIR relays "https://you.example,!n0"`): never fall back to n0.
 /// Hosts propagate it to every member, so the whole mesh stays on its own infrastructure.
 pub const NO_N0: &str = "!n0";
 
 #[derive(Clone, PartialEq, Debug)]
-pub struct Relay { pub url: String, pub token: Option<[u8; 32]> }
+pub struct Relay { pub url: String }
 
 impl Relay {
     pub fn parse(s: &str) -> Result<Self> {
         let s = s.trim();
-        if s == NO_N0 { return Ok(Self { url: NO_N0.into(), token: None }) }
-        let (u, t) = s.split_once('#').map_or((s, None), |(u, t)| (u, Some(t)));
-        let token = t.map(|t| -> Result<[u8; 32]> { hex::decode(t)?.try_into().map_err(|_| anyhow::anyhow!("token: 64 hex")) }).transpose()?;
-        Ok(Self { url: u.parse::<RelayUrl>()?.to_string(), token })
+        if s == NO_N0 { return Ok(Self { url: NO_N0.into() }) }
+        let u = s.split('#').next().unwrap_or_default();
+        Ok(Self { url: u.parse::<RelayUrl>()?.to_string() })
     }
     /// Comma-separated, preference order.
     pub fn list(s: &str) -> Result<Vec<Self>> { s.split(',').filter(|x| !x.trim().is_empty()).map(Self::parse).collect() }
-    pub fn show(l: &[Self]) -> String { l.iter().map(|r| r.token.map_or(r.url.clone(), |t| format!("{}#{}", r.url, hex::encode(t)))).collect::<Vec<_>>().join(",") }
-    pub(crate) fn n0() -> Self { Self { url: N0.into(), token: None } }
+    pub fn show(l: &[Self]) -> String { l.iter().map(|r| r.url.as_str()).collect::<Vec<_>>().join(",") }
+    pub(crate) fn n0() -> Self { Self { url: N0.into() } }
     pub(crate) fn enc(l: &[Self]) -> Vec<u8> { lp(Self::show(l).as_bytes()) }
     pub(crate) fn dec(r: &mut Rd) -> Result<Vec<Self>> { Self::list(std::str::from_utf8(r.lp()?)?) }
     /// Relays a *device* may ask hosts to dial: https with a DNS name only (no IP literals, so a member
@@ -58,7 +57,7 @@ mod tests {
         assert!(l[0].public().is_ok());
         assert!(l[1].public().is_err());
         assert!(Relay::parse("https://192.168.1.1/").unwrap().public().is_err());
-        assert!(Relay::parse("https://a.example/#xyz").is_err());
+        assert_eq!(Relay::parse("https://a.example/#old").unwrap(), l[0], "a token is dropped");
         let o = Relay::list("https://a.example/,!n0").unwrap();
         assert!(fallback(&o).is_none() && fallback(&l).is_some() && o[1].public().is_err());
         assert_eq!(Relay::list(&Relay::show(&o)).unwrap(), o);
