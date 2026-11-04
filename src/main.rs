@@ -1,18 +1,17 @@
 //! irpush: host daemon and CLI.
 const USAGE: &str = "\
 usage:
-  irpush DIR create [RELAYS]       found a mesh as its first host; RELAYS = \"https://r.example#hextoken,...\"
+  irpush DIR create [RELAYS]       found a mesh as its first host; RELAYS = \"https://r.example,...\"
   irpush DIR join TICKET [RELAYS]  join a mesh (RELAYS: an app's default relays, devices only)
   irpush DIR run [RELAYS]          run; prints \"sender app data\" (hex) per push; serves DIR/sock
   irpush DIR attach APP [APP...]   stream the pushes for these apps from the running node (any user program)
   irpush DIR ticket [host]         one-time ticket, valid 10 min (treat as a secret)
   irpush DIR push DEVICE APP       send stdin (<= 1536 B) to APP (e.g. org.example.chat) on DEVICE
-  irpush DIR relays RELAYS         set the mesh relays (also relay-token rotation)
+  irpush DIR relays RELAYS         set the mesh relays
   irpush DIR id | peers | revoke ID
   irpush DIR apns KEYID TEAMID < AuthKey.p8      host: send iOS pushes straight to APNs
   irpush DIR route apns|sandbox TOPIC TOKENHEX   device: APNs route (iOS apps do this via the C ABI)
   irpush DIR nse < B64             decrypt an APNs payload's \"f\", as the iOS extension does
-  irpush token                     random relay token, for relay.toml access.shared_token
 State key (KEK): $CREDENTIALS_DIRECTORY/irpush.kek (systemd-creds, TPM-bound; required when that is set), else DIR/kek.
 Logs: stderr, RUST_LOG (default irpush=info).";
 
@@ -67,7 +66,6 @@ async fn main() -> Result<()> {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let a: Vec<&str> = a.iter().map(String::as_str).collect();
     let (dir, cmd, rest) = match a.as_slice() {
-        ["token"] => { println!("{}", hex::encode(random32())); return Ok(()) }
         [d, c, r @ ..] => (Path::new(d), *c, r),
         _ => { eprintln!("{USAGE}"); std::process::exit(2) }
     };

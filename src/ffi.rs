@@ -77,7 +77,7 @@ fn start(path: &str, n: impl FnOnce() -> anyhow::Result<Node>, cb: Cb, ctx: *mut
 pub extern "C" fn irp_status(cb: StatusCb, ctx: *mut c_void) -> i32 { if STATUS.set((cb, Ctx(ctx))).is_ok() { 0 } else { -2 } }
 
 /// First launch: join with a ticket. `path`: state file in the App Group container; `kek`: 32 bytes;
-/// `relays`: the app's default push relays "https://r.example#hextoken,..." or NULL.
+/// `relays`: the app's default push relays "https://r.example,..." or NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn irp_join(path: *const c_char, kek: *const u8, ticket: *const c_char, relays_: *const c_char, cb: Cb, ctx: *mut c_void) -> i32 {
     let (Some(p), Some(kek), Some(t)) = (unsafe { s(path) }, unsafe { k(kek) }, unsafe { s(ticket) }) else { return -3 };
