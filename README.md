@@ -153,7 +153,7 @@ On DigitalOcean (the smallest droplet that installs is 2 GB; Hetzner works too):
 4. Use `https://irpush.<you>` as your app's relay or
    `irpush DIR relays ...` for a mesh (an irch storage node: `services.irch.pushRelayFile`).
 
-Later: `make update HOST=<ip>` applies changes; `make bump` moves the pinned nixpkgs and disko first.
+Later: `make update HOST=<ip>` applies changes (`./fix.sh <ip>`: pull, apply, check it is up); `make bump` moves the pinned nixpkgs and disko first.
 The VPS clamps TCP MSS to 1120 (fits WireGuard on a 1280-byte path),
 keeps logs at warn level for 7 days, and can upgrade itself nightly (`autoUpgrade`).
 
