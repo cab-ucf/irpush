@@ -24,6 +24,7 @@ for p in ping pq unlimited; do patch -sp1 < "../irpush/deploy/relay-$p.patch"; d
 cargo build -q --release --locked --features server,tls-aws-lc-rs --bin iroh-relay
 install -m755 target/release/iroh-relay /usr/local/bin/irpush-relay
 
+umask 022   # the service's own user reads its config (no secrets in it)
 cat > /etc/irpush-relay.toml <<E
 http_bind_addr = "0.0.0.0:80"
 enable_quic_addr_discovery = true
@@ -81,7 +82,9 @@ systemctl enable --now irpush-relay
 systemctl restart irpush-relay
 sleep 20
 if curl -fsS "https://$dom/ping" >/dev/null; then
-  echo "https://$dom is up, open to all"
+  echo "https://$dom is up, open to all. A key that lifts its rate limit:"
+  echo "  k=/var/lib/private/irpush-relay/keys; openssl rand -hex 32 >> \$k;" \
+    "chown --reference=\${k%/*} \$k; tail -1 \$k"
 else
   journalctl -u irpush-relay -n 20 --no-pager
   ss -ltnp 'sport = :443'
