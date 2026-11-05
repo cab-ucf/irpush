@@ -146,6 +146,11 @@ source IP; sockets idle for 135 min are closed. Direct paths are never limited; 
 cannot go direct, `make key HOST=<ip>` makes a key that lifts the rate limit (`url#key` in the app;
 `make keys` lists them, delete a line to revoke). A stock `iroh.<you>` relay can share the box (`irohDomain`), routed by SNI on :443.
 
+Already running Debian or Ubuntu, without Nix: as root,
+`sh deploy/debian.sh irpush.<you> you@<you>` builds the same patched relay with Rust, replaces any
+iroh-relay service there with one serving :443, :80 and UDP 7842 itself (no nginx, no nftables
+limits), and checks it answers.
+
 On DigitalOcean (the smallest droplet that installs is 2 GB; Hetzner works too):
 1. Create an Ubuntu droplet with an SSH key used only for it. Add an A record `irpush.<you>` -> its IP.
 2. In `deploy/config.nix`, set your domain, email and that SSH public key.
