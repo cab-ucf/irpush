@@ -1,3 +1,29 @@
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -737,6 +737,7 @@
+                     .request_handler(Method::GET, "/", Box::new(root_handler))
+                     .request_handler(Method::GET, "/index.html", Box::new(root_handler))
+                     .request_handler(Method::GET, RELAY_PROBE_PATH, Box::new(probe_handler))
++                    .request_handler(Method::GET, "/key", Box::new(key_handler))
+                     .request_handler(Method::GET, "/robots.txt", Box::new(robots_handler))
+                     .request_handler(Method::GET, "/healthz", Box::new(healthz_handler));
+                 if let Some(cfg) = relay_config.limits.client_rx {
+@@ -1038,6 +1039,15 @@
+         .body(body_empty())
+         .map_err(|err| Box::new(err) as HyperError)
+ }
++
++/// irpush: 204 if the bearer key lifts the rate limit here, else 403.
++fn key_handler(r: Request<Incoming>, response: ResponseBuilder) -> HyperResult<Response<BytesBody>> {
++    let ok = http_server::unlimited(r.headers());
++    response
++        .status(if ok { StatusCode::NO_CONTENT } else { StatusCode::FORBIDDEN })
++        .body(body_empty())
++        .map_err(|err| Box::new(err) as HyperError)
++}
+ 
+ fn robots_handler(
+     _r: Request<Incoming>,
 --- a/src/server/http_server.rs
 +++ b/src/server/http_server.rs
 @@ -853,8 +853,14 @@
@@ -8,7 +34,7 @@
 -            .map_err(|err| e!(AcceptError::RateLimitingMisconfigured, err))?;
 +        // irpush: a key in $RELAY_KEYS (a file, one per line) lifts the rate limit, for big transfers
 +        // that cannot go direct. Everyone else keeps the fair share.
-+        let io = if unlimited(&request_parts) {
++        let io = if unlimited(&request_parts.headers) {
 +            RateLimited::unlimited(io, self.metrics.clone())
 +        } else {
 +            RateLimited::from_watcher(io, self.rate_limit.subscribe(), self.metrics.clone())
@@ -23,9 +49,9 @@
  }
 +
 +/// irpush: whether the client's bearer key is one of `$RELAY_KEYS`'s lines.
-+fn unlimited(req: &http::request::Parts) -> bool {
++pub(crate) fn unlimited(h: &http::HeaderMap) -> bool {
 +    let Some(path) = std::env::var_os("RELAY_KEYS") else { return false };
-+    let Some(key) = req.headers.get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else { return false };
++    let Some(key) = h.get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else { return false };
 +    let Some(key) = key.strip_prefix("Bearer ").filter(|k| k.len() >= 32) else { return false };
 +    std::fs::read_to_string(path).is_ok_and(|f| f.lines().any(|l| l.trim() == key))
 +}

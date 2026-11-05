@@ -144,7 +144,8 @@ anyone may connect, so every device homed on it is reachable by everyone, and th
 bound abuse: bytes per connection (iroh-relay), new connections (nftables) and open ones (nginx) per
 source IP; sockets idle for 135 min are closed. Direct paths are never limited; for transfers that
 cannot go direct, `make key HOST=<ip>` makes a key that lifts the rate limit (`url#key` in the app;
-`make keys` lists them, delete a line to revoke). A stock `iroh.<you>` relay can share the box (`irohDomain`), routed by SNI on :443.
+`make keys` lists them, delete a line to revoke; `GET /key` with the key as bearer answers 204 if
+it lifts the limit, else 403). A stock `iroh.<you>` relay can share the box (`irohDomain`), routed by SNI on :443.
 
 Already running Debian or Ubuntu, without Nix: as root,
 `sh deploy/debian.sh irpush.<you> you@<you>` builds the same patched relay with Rust, replaces any
