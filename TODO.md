@@ -15,9 +15,19 @@ irch's plan (the why): irch's PLAN.md.
       provider's DNS); or a storage node with a public address serves one
 
 ## One socket per device
-- [ ] Desktops: irch's iroh endpoint and irpush's device on one relay
-      socket (one endpoint shared by every iroh app, as on phones)
-- [ ] Measure: packets an idle device sends a day, per relay
+- [ ] An iroh custom transport over the device's irpush socket
+      (`unstable-custom-transports`): an app's endpoint keeps no relay of
+      its own (then, measured, it sends nothing at rest), is reached
+      through the socket already up, and answers a ring one round trip
+      later; desktops too (irch's endpoint and irpush's device as one)
+- [x] Measure an idle iroh endpoint: ~69k packets a day (README, Battery)
+- [ ] Measure an idle irpush device on a phone, per relay
+
+## Upstream (iroh)
+- [ ] Cache the first QAD report (iroh#4523): ~25 MB a day per idle
+      endpoint, a QUIC handshake every 20-26 s
+- [ ] One end of a connection keeps each path alive, and stops after
+      idle, as iroh 0.35 did (noq#810)
 
 ## Hosts that form themselves
 - [ ] An app's hosts of one owner join one mesh with no manual ticket

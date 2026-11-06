@@ -27,7 +27,9 @@ infrastructure; one optional VPS improves Android battery and privacy.
 
 ## How it works
 - **Hosts** (desktops): queue pushes for 24 h, issue pairing tickets, introduce members, revoke,
-  post to APNs directly for iOS. They listen on every relay a member might use.
+  post to APNs directly for iOS. They listen on every relay a member might use, and on n0's only
+  while a device may be there (a push for a device whose relay is unknown, or a frame heard
+  there; an hour after the last), since n0's relay pings its clients every 16-20 s.
 - **Devices** (phones): one TLS/TCP connection to the first working relay, preferring the mesh's
   relays, then the app's defaults, then n0's public relay as the always-available last resort.
   `Node::relay_watch` / `irp_status` / `Irpush.relayChanged` report when n0 is in use, so apps can
@@ -137,9 +139,16 @@ Info.plist (both): `IrpushGroup = group.your.app`; app, optional: `IrpushRelays 
         override func render(app: Data, data: Data) -> (title: String, body: String) { ("Chat", String(decoding: data, as: UTF8.self)) }
     }
 
+Calls: an alert reaches a suspended app only when tapped, so it cannot ring. With the Voice over IP
+background mode, `Irpush.voip` registers PushKit; its token becomes the route of
+`app(bundle id + ".voip")`, and hosts send that app's pushes as VoIP pushes (now or never: a ring
+this late is no ring). Each wakes the app, which opens it on the phone and reports the call:
+
+    Irpush.voip { m, done in /* CXProvider.reportNewIncomingCall(...) for m (nil: a duplicate, end it) */ done() }
+
 ## Your own relay (optional VPS)
 `irpush.<you>` is iroh's relay with one change: it pings a client only after 130 min of silence
-instead of every 15 s, so phones drive their own learned heartbeats (up to 2 h). It is open:
+instead of 16-20 s, so phones drive their own learned heartbeats (up to 2 h). It is open:
 anyone may connect, so every device homed on it is reachable by everyone, and the limits
 bound abuse: bytes per connection (iroh-relay), new connections (nftables) and open ones (nginx) per
 source IP; sockets idle for 135 min are closed. Direct paths are never limited; for transfers that
@@ -165,11 +174,20 @@ keeps logs at warn level for 7 days, and can upgrade itself nightly (`autoUpgrad
 
 ## Battery
 One socket per phone; heartbeats up to 2 h (learned per network, persisted; RFC 5382 has NATs keep
-idle TCP 2 h 4 min), hosts every 28 min; any inbound traffic
+idle TCP 2 h 4 min), hosts every 28 min; any inbound traffic, a relay's own ping included,
 counts as a heartbeat; relay preference re-checked only on wakeups that happen anyway; failing relays
 backed off (5 min .. 6 h); no network (`network(OFFLINE)`) parks the device with no retries at all.
-Stock iroh relays (n0's, or yours unpatched) ping every client every 15 s, which keeps a phone's
-radio awake: the battery target needs the patched relay below. `!n0` keeps a mesh off n0's.
+Stock iroh relays (n0's, or yours unpatched) ping a client after 16-20 s of its silence, which keeps
+a phone's radio awake (and teaches no heartbeat: none is learned there): the battery target needs
+the patched relay below. `!n0` keeps a mesh off n0's.
+
+Your apps' own iroh endpoints must not stay up in the background. Measured (iroh 1.4.1, one relay,
+idle, no connections): ~69k packets and ~27 MB a day. Its client pings the relay every 15 s whatever
+the relay does, makes a new QUIC address-discovery handshake every 20-26 s (iroh#4523) while keeping
+an older one alive every 25 s, and searches for UPnP every ~23 s (the `portmapper` feature). Each
+open connection adds ~66k a day per path: both ends ping every 5 s, and iroh refuses a longer
+interval. With no relay and no connection it sends nothing. So close the endpoint, or every
+connection and the relay, when idle (irch, pasa); irpush wakes it.
 
 Chatter: a device sends on state changes only (one Hello per host when it connects or changes
 network, one Ack per push), plus the one keepalive its NAT needs: a ping per learned heartbeat, 12 a
@@ -186,7 +204,8 @@ from memory when dropped.
 per-app routes, an end-to-end mesh over an in-process relay (late-host pairing, introductions, two
 hosts, offline queue, parking with no network, revocation, identity and key guards), the shared node
 (attach, device id, fall-through to the owner, refused attach, single owner), the `!n0` opt-out, PSK
-mixing against a forging introducer, per-device listen slots, and the delivered-id log's trimming.
+mixing against a forging introducer, per-device listen slots, n0 on demand, a pinging relay as the
+heartbeat (and no learning there), VoIP push shape, and the delivered-id log's trimming.
 CI also runs clippy with `-D warnings`, `cargo audit`, and builds the iOS xcframework and Swift package.
 
 ## Limits
