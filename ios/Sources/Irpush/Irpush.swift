@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 import IrpushC
 import Network
+import PushKit
 import Security
 import UserNotifications
 #if canImport(UIKit)
@@ -9,7 +10,7 @@ import UIKit
 #endif
 
 /// irpush for iOS. Info.plist (app and extension): `IrpushGroup` = App Group (also the shared
-/// Keychain access group); app only, optional: `IrpushRelays` = "https://push.you.example#hextoken".
+/// Keychain access group); app only, optional: `IrpushRelays` = "https://push.you.example,..."
 /// iOS forbids sockets across apps, so apps of one team share the identity through the App Group
 /// (one device id, one APNs route per app); each foreground app holds the socket while it runs.
 public enum Irpush {
@@ -82,13 +83,28 @@ public enum Irpush {
     }
 
     /// From application(_:didRegisterForRemoteNotificationsWithDeviceToken:).
-    public static func register(apnsToken t: Data) {
+    public static func register(apnsToken t: Data) { route(t, topic: Bundle.main.bundleIdentifier!) }
+
+    static func route(_ t: Data, topic: String) {
         #if DEBUG
         let sandbox = true
         #else
         let sandbox = false
         #endif
-        t.withUnsafeBytes { _ = irp_route(sandbox, Bundle.main.bundleIdentifier!, $0.bindMemory(to: UInt8.self).baseAddress, t.count) }
+        t.withUnsafeBytes { _ = irp_route(sandbox, topic, $0.bindMemory(to: UInt8.self).baseAddress, t.count) }
+    }
+
+    /// Calls ring at once, even with the app not running: pushes for `app(bundle id + ".voip")`
+    /// go out as PushKit (VoIP) pushes, now or never. `ring` gets each one (nil: a duplicate)
+    /// and must report a call to CallKit before it returns, Apple's rule for every VoIP push
+    /// (a duplicate: report one and end it at once); then call `done`.
+    /// Needs the "Voice over IP" background mode. Call at launch, after `start`.
+    public static func voip(_ ring: @escaping (_ m: (from: Data, app: Data, data: Data)?, _ done: @escaping () -> Void) -> Void) {
+        VoIP.shared.ring = ring
+        let r = PKPushRegistry(queue: .main)
+        r.delegate = VoIP.shared
+        r.desiredPushTypes = [.voIP]
+        VoIP.shared.registry = r
     }
 
     /// This device's id; hosts push to it.
@@ -103,6 +119,21 @@ public enum Irpush {
         var from = [UInt8](repeating: 0, count: 32), app = [UInt8](repeating: 0, count: 16), out = [UInt8](repeating: 0, count: 1536)
         let n = irp_notification(path, k, f, &from, &app, &out, out.count)
         return n < 0 ? nil : (Data(from), Data(app), Data(out[..<n]))
+    }
+}
+
+/// PushKit's delegate: its token becomes the app's ".voip" route; each push is opened on the phone.
+final class VoIP: NSObject, PKPushRegistryDelegate {
+    static let shared = VoIP()
+    var registry: PKPushRegistry?
+    var ring: ((from: Data, app: Data, data: Data)?, @escaping () -> Void) -> Void = { _, done in done() }
+
+    func pushRegistry(_ r: PKPushRegistry, didUpdate c: PKPushCredentials, for t: PKPushType) {
+        Irpush.route(c.token, topic: Bundle.main.bundleIdentifier! + ".voip")
+    }
+
+    func pushRegistry(_ r: PKPushRegistry, didReceiveIncomingPushWith p: PKPushPayload, for t: PKPushType, completion: @escaping () -> Void) {
+        ring((p.dictionaryPayload["f"] as? String).flatMap { Irpush.open(notification: $0) }, completion)
     }
 }
 

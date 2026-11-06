@@ -118,6 +118,24 @@ pub(crate) fn jwt(creds: &str) -> Result<String> {
     Ok(format!("{m}.{}", BASE64URL_NOPAD.encode(&sig.to_bytes())))
 }
 
+impl Route {
+    /// PushKit's route (topic "<bundle id>.voip"): a call rings now or never.
+    pub(crate) fn voip(&self) -> bool {
+        self.topic.ends_with(".voip")
+    }
+}
+
+/// Push type, expiration and body: an alert waits up to a day for the phone
+/// and its extension decrypts it; a VoIP push wakes the app itself, at once.
+fn shape(r: &Route, f: &str) -> (&'static str, u64, String) {
+    if r.voip() {
+        return ("voip", 0, format!(r#"{{"f":"{f}"}}"#));
+    }
+    let aps =
+        format!(r#"{{"alert":{{"body":"{ALERT}"}},"mutable-content":1}}"#);
+    ("alert", now() + 86400, format!(r#"{{"aps":{aps},"f":"{f}"}}"#))
+}
+
 pub(crate) enum Sent {
     Ok,
     Gone,
@@ -145,16 +163,15 @@ pub(crate) async fn post(
         base.as_deref().unwrap_or(host),
         hex::encode(&r.token)
     );
-    let aps =
-        format!(r#"{{"alert":{{"body":"{ALERT}"}},"mutable-content":1}}"#);
+    let (kind, exp, body) = shape(r, frame_b64);
     let res = http
         .post(url)
         .bearer_auth(auth)
         .header("apns-topic", &r.topic)
-        .header("apns-push-type", "alert")
+        .header("apns-push-type", kind)
         .header("apns-priority", "10")
-        .header("apns-expiration", (now() + 86400).to_string())
-        .body(format!(r#"{{"aps":{aps},"f":"{frame_b64}"}}"#))
+        .header("apns-expiration", exp.to_string())
+        .body(body)
         .send()
         .await;
     let res = match res {
@@ -220,6 +237,11 @@ mod tests {
             parse_route(&remove(&blob, &app("org.x.app")), &app("org.x.app"))
                 .is_err()
         );
+        let call = route(Svc::Apns, "org.x.app.voip", &[5; 32]).unwrap();
+        let call = parse_route(&merge(&blob, &call), &app("org.x.app.voip"));
+        let (kind, exp, body) = shape(&call.unwrap(), "F");
+        assert!(kind == "voip" && exp == 0 && body == r#"{"f":"F"}"#);
+        assert_eq!(shape(&r, "F").0, "alert", "a bundle's own topic: alerts");
         assert!(
             route(Svc::Apns, "", &[1]).is_err()
                 && route(Svc::Apns, "x", &[]).is_err()

@@ -6,10 +6,11 @@
 typedef void (*irp_status_cb)(void *ctx, const char *url, bool fallback);
 int32_t irp_status(irp_status_cb cb, void *ctx);
 typedef void (*irp_cb)(void *ctx, const uint8_t *from, const uint8_t *app, const uint8_t *data, size_t len);
-/* relays: app's default push relays "url#hextoken,url" in preference order, or NULL.
+/* relays: app's default push relays "https://a.example,https://b.example" in preference order, or NULL.
    join/open: -4 = another process runs this node (attach instead). */
 int32_t irp_join(const char *path, const uint8_t *kek, const char *ticket, const char *relays, irp_cb cb, void *ctx);
 int32_t irp_open(const char *path, const uint8_t *kek, const char *relays, irp_cb cb, void *ctx);
+/* APNs token for topic (bundle id); PushKit's under "<bundle id>.voip": pushes to that app ring as calls. */
 int32_t irp_route(bool sandbox, const char *topic, const uint8_t *token, size_t len);
 /* One owner process per phone serves the local socket; other apps attach to it for their app ids.
    auth: may uid receive pushes for app (16 B)? attach: out_id gets the shared 32 B device id;

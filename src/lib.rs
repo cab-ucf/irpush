@@ -1647,7 +1647,7 @@ impl Node {
         };
         let token = Mutex::new((String::new(), 0u64)); // JWT, reused 40 min
         let one = |id: Id, wait: bool| {
-            let (http, token) = (&http, &token);
+            let (http, token, t0) = (&http, &token, Instant::now());
             async move {
                 for d in [wait as u64, 10, 60, 300, 1800] {
                     sleep(Duration::from_secs(d)).await;
@@ -1679,6 +1679,10 @@ impl Node {
                         }
                         (to, app, route, f, t.0.clone())
                     };
+                    // A ring this late is no ring.
+                    if route.voip() && t0.elapsed() > Duration::from_secs(20) {
+                        return Ok(());
+                    }
                     match apns::post(http, &route, &auth, &f).await? {
                         apns::Sent::Ok => {
                             if let Some(p) = self.lock().pending.get_mut(&id) {
