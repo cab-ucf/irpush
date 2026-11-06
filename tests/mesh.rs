@@ -324,3 +324,24 @@ async fn two_meshes() {
     a.push(dev.id(), &x, b"still").unwrap();
     assert_eq!(recv(&mut rx).await.2, b"still");
 }
+
+/// Any two nodes on one relay, paired or not: an event goes straight there.
+#[tokio::test(flavor = "multi_thread")]
+async fn events() {
+    let (_s, r) = relay().await;
+    let (a, b) = (dir(), dir());
+    let a = Arc::new(
+        Node::create(a.join("n"), random32(), vec![r.clone()]).unwrap(),
+    );
+    let b = Arc::new(
+        Node::create(b.join("n"), random32(), vec![r.clone()]).unwrap(),
+    );
+    let (_ra, _) = run(a.clone());
+    let (_rb, mut rx) = run(b.clone());
+    until(|| !a.on().is_empty() && !b.on().is_empty()).await;
+    let ch = app("org.example.chat");
+    assert!(!a.event(b.id(), "https://elsewhere.example", &ch, b"hi"));
+    assert!(!a.event(b.id(), &r.url, &ch, &[0; irpush::EVENT + 1]));
+    assert!(a.event(b.id(), &a.on()[0], &ch, b"hi"));
+    assert_eq!(recv(&mut rx).await, (a.id(), ch, b"hi".to_vec()));
+}
