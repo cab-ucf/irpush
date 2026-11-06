@@ -1,5 +1,6 @@
-//! Push relay addresses: `url` (an older `url#token` is read as `url`: relays
-//! are open).
+//! Push relay addresses: `url`, or `url#sha256=HEX` for a relay whose own
+//! certificate is pinned (a desktop's, by its address). An older `url#token`
+//! is read as `url`: relays are open.
 use crate::proto::{Rd, lp};
 use anyhow::{Result, ensure};
 use iroh_base::RelayUrl;
@@ -19,26 +20,42 @@ pub const NO_N0: &str = "!n0";
 #[derive(Clone, PartialEq, Debug)]
 pub struct Relay {
     pub url: String,
+    /// SHA-256 of the relay's certificate, trusted instead of a certificate
+    /// authority: a host's own relay at an IP address, self-signed.
+    pub pin: Option<[u8; 32]>,
+}
+
+impl std::fmt::Display for Relay {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.url)?;
+        match self.pin {
+            Some(p) => write!(f, "#sha256={}", hex::encode(p)),
+            None => Ok(()),
+        }
+    }
 }
 
 impl Relay {
     pub fn parse(s: &str) -> Result<Self> {
         let s = s.trim();
         if s == NO_N0 {
-            return Ok(Self { url: NO_N0.into() });
+            return Ok(Self { url: NO_N0.into(), pin: None });
         }
-        let u = s.split('#').next().unwrap_or_default();
-        Ok(Self { url: u.parse::<RelayUrl>()?.to_string() })
+        let (u, frag) = s.split_once('#').unwrap_or((s, ""));
+        let pin = frag
+            .strip_prefix("sha256=")
+            .and_then(|h| hex::decode(h).ok()?.try_into().ok());
+        Ok(Self { url: u.parse::<RelayUrl>()?.to_string(), pin })
     }
     /// Comma-separated, preference order.
     pub fn list(s: &str) -> Result<Vec<Self>> {
         s.split(',').filter(|x| !x.trim().is_empty()).map(Self::parse).collect()
     }
     pub fn show(l: &[Self]) -> String {
-        l.iter().map(|r| r.url.as_str()).collect::<Vec<_>>().join(",")
+        l.iter().map(Self::to_string).collect::<Vec<_>>().join(",")
     }
     pub(crate) fn n0() -> Self {
-        Self { url: N0.into() }
+        Self { url: N0.into(), pin: None }
     }
     pub(crate) fn enc(l: &[Self]) -> Vec<u8> {
         lp(Self::show(l).as_bytes())
@@ -107,5 +124,16 @@ mod tests {
                 && o[1].public().is_err()
         );
         assert_eq!(Relay::list(&Relay::show(&o)).unwrap(), o);
+        let pinned =
+            format!("https://203.0.113.5:7843/#sha256={}", "cd".repeat(32));
+        let p = Relay::parse(&pinned).unwrap();
+        assert!(
+            p.pin == Some([0xcd; 32]) && p.to_string() == pinned,
+            "a pin stays"
+        );
+        assert_eq!(
+            Relay::list(&Relay::show(std::slice::from_ref(&p))).unwrap(),
+            [p]
+        );
     }
 }

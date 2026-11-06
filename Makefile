@@ -9,6 +9,20 @@ IOS := aarch64-apple-ios aarch64-apple-ios-sim
 build:
 	cargo build --release
 
+# A host with its own relay (`irpush DIR run --serve PORT`) that pings its
+# members hours apart: built against iroh-relay with the ping interval patch.
+RELAY := target/iroh-relay-1.4.1
+REGISTRY := $(or $(CARGO_HOME),$(HOME)/.cargo)/registry/src
+desktop:
+	cargo fetch
+	test -d $(RELAY) || { mkdir -p target && \
+	  cp -r $(firstword $(wildcard $(REGISTRY)/*/iroh-relay-1.4.1)) $(RELAY) && \
+	  patch -s -d $(RELAY) -p1 < deploy/iroh-relay-ping-interval.patch; }
+	cp Cargo.lock target/Cargo.lock.orig
+	cargo build --release --features relay-ping \
+	  --config 'patch.crates-io.iroh-relay.path="$(RELAY)"'; \
+	  s=$$?; cp target/Cargo.lock.orig Cargo.lock; exit $$s
+
 deploy:
 	nix run github:nix-community/nixos-anywhere -- --build-on remote --flake .#relay root@$(HOST)
 
@@ -33,4 +47,4 @@ ios:
 	  -library target/aarch64-apple-ios-sim/release/libirpush.a -headers ios/include \
 	  -output Irpush.xcframework
 
-.PHONY: build deploy update key keys bump ios
+.PHONY: build desktop deploy update key keys bump ios
