@@ -11,6 +11,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.LinkProperties
@@ -57,10 +58,13 @@ internal object Native {
 private fun ByteArray.hex() = joinToString("") { "%02x".format(it) }
 private val main = Handler(Looper.getMainLooper())
 
-/** The phone's one owner: the irpush app installed first (same answer in every app). */
+/** The owner: the irpush app signed by this app's key that was installed
+ *  first (the same answer in every app of the group). An app signed by
+ *  another key is never trusted with this app's pushes. */
 internal fun owner(ctx: Context): ComponentName? {
     val pm = ctx.packageManager
     return pm.queryIntentServices(Intent(ATTACH), 0).map { it.serviceInfo }
+        .filter { pm.checkSignatures(ctx.packageName, it.packageName) == PackageManager.SIGNATURE_MATCH }
         .minWithOrNull(compareBy({ pm.getPackageInfo(it.packageName, 0).firstInstallTime }, { it.packageName }))
         ?.let { ComponentName(it.packageName, it.name) }
 }
@@ -82,11 +86,16 @@ object Irpush {
     private var to: Messenger? = null
     private var bound: ComponentName? = null
 
+    /** From the owner. A message missing its extras, or failing to
+     *  unparcel, is ignored: never a crash. */
     private val me = Messenger(Handler(Looper.getMainLooper()) { m ->
-        when (m.what) {
-            ID -> m.data.getString("id")!!.let { id = it; if (it.isNotEmpty()) up(); onId(it) }
-            PUSH -> onPush?.invoke(m.data.getString("from")!!, m.data.getByteArray("d")!!)
-            JOINED -> joined(m.data.getBoolean("ok")).also { joined = {} }
+        runCatching {
+            val b = m.data
+            when (m.what) {
+                ID -> b.getString("id")?.let { id = it; if (it.isNotEmpty()) up(); onId(it) }
+                PUSH -> b.getString("from")?.let { from -> b.getByteArray("d")?.let { onPush?.invoke(from, it) } }
+                JOINED -> joined(b.getBoolean("ok")).also { joined = {} }
+            }
         }
         true
     })
@@ -147,7 +156,7 @@ private object Hub {
     var id: String? = null
     val clients = HashMap<String, Messenger>()
     val held = HashMap<String, ArrayDeque<Bundle>>()
-    val me by lazy { Messenger(Handler(Looper.getMainLooper()) { m -> handle(m); true }) }
+    val me by lazy { Messenger(Handler(Looper.getMainLooper()) { m -> runCatching { handle(m) }; true }) }
 
     fun open(ticket: String?) {
         val was = id
