@@ -6,7 +6,9 @@ use iroh_base::RelayUrl;
 
 /// n0's public relay: always the last-resort fallback, so connectivity never
 /// depends on one relay. Frames stay end-to-end encrypted; n0 sees endpoint
-/// ids, IPs and timing. Its ~15 s pings cost Android battery while in use.
+/// ids, IPs and timing. It pings a silent client every 16-20 s, which costs a
+/// phone battery while in use; hosts with relays of their own hold it only
+/// while a device may be there.
 pub const N0: &str = "https://use1-1.relay.n0.iroh.link./";
 /// In the mesh relays (`irpush DIR relays "https://you.example,!n0"`): never
 /// fall back to n0.
