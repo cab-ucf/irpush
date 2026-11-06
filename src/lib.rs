@@ -1494,7 +1494,24 @@ impl Node {
                     In::EndpointGone(id) => {
                         self.lock().via.retain(|p, u| !(*p == id && u == url));
                     }
-                    In::Ping(d) => c.send(Out::Pong(d)).await?,
+                    // A relay that pings us (a stock one: every 16-20 s of
+                    // our silence) proves the inbound path as a push does,
+                    // so its ping is our heartbeat; it also keeps the NAT
+                    // awake, so no heartbeat is learned there. The radio is
+                    // up anyway: a good moment to go back to a better relay.
+                    In::Ping(d) => {
+                        c.send(Out::Pong(d)).await?;
+                        let mut st = self.lock();
+                        if probe.take().is_some() {
+                            st.probe = 0;
+                        }
+                        if ping.is_none() {
+                            due = Instant::now() + hb(&st);
+                        }
+                        if moved(&st) {
+                            bail!("moving to preferred relay");
+                        }
+                    }
                     In::Pong(d) if Some(d) == ping => {
                         (ping, due) = (None, Instant::now() + hb(&self.lock()))
                     }
@@ -1722,6 +1739,42 @@ mod tests {
             vec![],
         );
         assert!(State::new(own).candidates().iter().all(|r| r.url != N0));
+    }
+
+    /// A stock relay pings us after 16-20 s of silence: that ping is the
+    /// heartbeat there, and the NAT it keeps awake teaches nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_relay_that_pings_is_the_heartbeat() {
+        use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+        let mut cfg = ServerConfig::default();
+        cfg.relay = Some(RelayConfig::new(([127, 0, 0, 1], 0)));
+        let srv = Server::spawn(cfg).await.unwrap();
+        let r = Relay::parse(&format!("http://{}", srv.http_addr().unwrap()));
+        let dir = std::env::temp_dir()
+            .join(format!("irpush-hb-{}", hex::encode(rnd::<4>())));
+        std::fs::create_dir_all(&dir).unwrap();
+        let h = Node::create(dir.join("h"), rnd(), vec![r.unwrap()]).unwrap();
+        let t = h.ticket(Role::Device).unwrap();
+        let d = Node::join(dir.join("d"), rnd(), &t, vec![]).unwrap();
+        let (h, d) = (std::sync::Arc::new(h), std::sync::Arc::new(d));
+        for n in [h.clone(), d.clone()] {
+            tokio::spawn(async move { n.run(|_, _, _| {}).await });
+        }
+        async fn until(d: &Node, f: fn(&State) -> bool, what: &str) {
+            let t = Duration::from_secs(40);
+            let wait = async {
+                while !f(&d.lock()) {
+                    sleep(Duration::from_millis(100)).await
+                }
+            };
+            timeout(t, wait).await.expect(what)
+        }
+        until(&d, |st| !st.hosts().is_empty(), "paired").await;
+        d.network(1); // a new session probes the heartbeat
+        until(&d, |st| st.probe != 0, "probing").await;
+        until(&d, |st| st.probe == 0, "the relay's ping ends it").await;
+        assert!(d.lock().d.hb.is_empty(), "nothing learned");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn peer(
