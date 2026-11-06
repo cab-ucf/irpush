@@ -94,6 +94,8 @@ const MAX_RATE: u32 = 16;
 const PONG: Duration = Duration::from_secs(15);
 /// `Node::network(OFFLINE)`: no network; the device parks instead of retrying.
 pub const OFFLINE: u64 = u64::MAX;
+/// Most an event carries: under a frame, so never taken for one.
+pub const EVENT: usize = FRAME - 17;
 
 type Tx = mpsc::UnboundedSender<(EndpointId, Vec<u8>)>;
 
@@ -599,6 +601,29 @@ impl Node {
         Ok(())
     }
 
+    /// An event for app `app` on `to`, now, through `relay` if we are on
+    /// it: one datagram, neither queued, acked nor sealed (the app seals and
+    /// acks its own). Whether it left.
+    pub fn event(
+        &self,
+        to: EndpointId,
+        relay: &str,
+        app: &App,
+        d: &[u8],
+    ) -> bool {
+        let Ok(want) = relay.parse::<RelayUrl>() else { return false };
+        let s = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = s.iter().find(|(u, _)| u.parse().ok() == Some(want.clone()));
+        let ok = d.len() <= EVENT;
+        ok && tx.is_some_and(|t| t.1.send((to, [app, d].concat())).is_ok())
+    }
+
+    /// The relays we are on now: where events reach us.
+    pub fn on(&self) -> Vec<String> {
+        let s = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        s.keys().cloned().collect()
+    }
+
     /// iOS device: register or refresh one app's APNs token (`topic` = its
     /// bundle id; several apps share the device). Announced to hosts, sealed.
     pub fn set_route(&self, svc: Svc, topic: &str, token: &[u8]) -> Result<()> {
@@ -768,6 +793,13 @@ impl Node {
         f: &[u8],
         on: &impl Fn(EndpointId, App, &[u8]),
     ) -> Result<()> {
+        // Not a frame's size: an event, the app's to check.
+        if f.len() != FRAME {
+            if let Some((app, d)) = f.split_first_chunk::<16>() {
+                on(from, *app, d);
+            }
+            return Ok(());
+        }
         let mut st = self.lock();
         let Some(opened) = st.open(from, f) else {
             // A known peer we cannot decrypt holds a stale key of ours: resync

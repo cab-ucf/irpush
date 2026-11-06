@@ -46,6 +46,12 @@ infrastructure; one optional VPS improves Android battery and privacy.
   host can serve many people's phones without telling one of another. irpush only wakes: apps find
   and reach each other's devices in their own protocol (irch: a space's signed member and device
   lists, then iroh by endpoint id), and push through a host only to wake one.
+- **Events**: any node (desktop or phone, host or device) is reachable by its id on the relay
+  it holds, so apps send small events (`Node::event`, <= `EVENT` B) straight there: one
+  datagram, no connection, no handshake, on the one quiet socket. Not queued, acked or sealed by
+  irpush: the app seals, authenticates and acks its own (irch: its signed, sealed ops) and dials
+  iroh (QUIC) for anything big or unacked. Anyone who knows a node's id can send it events;
+  the app drops what it cannot open.
 - **iOS**: Apple forbids sockets across apps, so apps of one team share the identity through the App
   Group (one device id, one APNs route per app, sent as `Route` frames) and each foreground app holds
   the socket while it runs. In the background the socket is closed; hosts post the same sealed frame
@@ -92,7 +98,7 @@ relay can link a device's sessions over time. Device-suggested relays must be `h
     irpush ~/.irpush relays "https://a.example,https://b.example"   # later changes
     irpush ~/.irpush relays "https://a.example,!n0"   # never fall back to n0 (whole mesh)
 
-Library: `Node::{create, join, open}`, `run(callback)`, `push`, `ticket`, `revoke`, `set_relays`,
+Library: `Node::{create, join, open}`, `run(callback)`, `push`, `event` / `on`, `ticket`, `revoke`, `set_relays`,
 `set_route` / `set_apns_key` (iOS), `network` / `kick` / `pause` (platform hooks); `local::{bind,
 serve, attach}` and `Local::deliver` for the shared node. C ABI: `src/ffi.rs` (`irp_serve` / `irp_attach`).
 

@@ -15,6 +15,7 @@ irch's plan (the why): irch's PLAN.md.
       provider's DNS); or a storage node with a public address serves one
 
 ## One socket per device
+- [x] Events: any two nodes on one relay, one datagram each (`Node::event`)
 - [ ] An iroh custom transport over the device's irpush socket
       (`unstable-custom-transports`): an app's endpoint keeps no relay of
       its own (then, measured, it sends nothing at rest), is reached
