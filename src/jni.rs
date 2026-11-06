@@ -24,6 +24,7 @@ fn s(e: &mut JNIEnv, j: &JString) -> Option<String> {
 
 fn run(n: Node) -> Arc<Node> {
     let n = NODE.get_or_init(|| Arc::new(n)).clone();
+    crate::share(n.clone());
     let m = n.clone();
     std::thread::spawn(move || {
         let Ok(rt) =
@@ -32,6 +33,9 @@ fn run(n: Node) -> Arc<Node> {
             return;
         };
         let _ = rt.block_on(m.run(|from, app, d| {
+            if crate::tapped(from, &app, d) {
+                return;
+            }
             let mut q = Q.0.lock().unwrap_or_else(|e| e.into_inner());
             if q.len() < 1024 {
                 q.push_back([from.as_bytes(), &app[..], d].concat())

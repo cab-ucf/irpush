@@ -58,7 +58,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     },
     time::Duration,
@@ -96,6 +96,34 @@ const MAX_RATE: u32 = 16;
 const PONG: Duration = Duration::from_secs(15);
 /// `Node::network(OFFLINE)`: no network; the device parks instead of retrying.
 pub const OFFLINE: u64 = u64::MAX;
+/// The node this process runs for the whole phone (Android's owner), so
+/// apps in it send and hear events through it too.
+static SHARED: OnceLock<Arc<Node>> = OnceLock::new();
+type Tap = Box<dyn Fn(EndpointId, &[u8]) + Send + Sync>;
+static TAPS: Mutex<Vec<(App, Tap)>> = Mutex::new(vec![]);
+
+pub fn shared() -> Option<Arc<Node>> {
+    SHARED.get().cloned()
+}
+
+pub(crate) fn share(n: Arc<Node>) {
+    let _ = SHARED.set(n);
+}
+
+/// What the shared node hears for `app`, in this process: to `f`, not the
+/// platform.
+pub fn tap(app: App, f: impl Fn(EndpointId, &[u8]) + Send + Sync + 'static) {
+    let mut t = TAPS.lock().unwrap_or_else(|e| e.into_inner());
+    t.retain(|x| x.0 != app);
+    t.push((app, Box::new(f)));
+}
+
+pub(crate) fn tapped(from: EndpointId, app: &App, d: &[u8]) -> bool {
+    let t = TAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let f = t.iter().find(|x| x.0 == *app);
+    f.map(|f| (f.1)(from, d)).is_some()
+}
+
 /// Most an event carries: under a frame, so never taken for one.
 pub const EVENT: usize = FRAME - 17;
 
