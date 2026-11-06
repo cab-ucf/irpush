@@ -57,7 +57,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     },
     time::Duration,
 };
@@ -163,6 +163,8 @@ struct State {
     probe: u64,
     echoed: bool,
     echo_alive: bool,
+    // Host: unix time until which it holds n0's relay (`want_n0`).
+    n0_until: AtomicU64,
 }
 
 impl State {
@@ -187,6 +189,7 @@ impl State {
             probe: 0,
             echoed: false,
             echo_alive: false,
+            n0_until: AtomicU64::new(0),
         }
     }
     fn id(&self) -> EndpointId {
@@ -275,7 +278,28 @@ impl State {
                 l.push(r)
             }
         }
-        relay::dedup(l.into_iter().chain(relay::fallback(&self.d.relays)))
+        let n0 = relay::fallback(&self.d.relays).filter(|_| self.n0());
+        relay::dedup(l.into_iter().chain(n0))
+    }
+
+    /// Host: whether to hold n0's relay too. Always when the mesh has no relay
+    /// of its own (n0 is then its relay); else only while a device may be
+    /// there, as a stock relay pings every 16-20 s.
+    fn n0(&self) -> bool {
+        let own = self.d.relays.iter().any(|r| r.url != relay::NO_N0);
+        !own || self.n0_until.load(Relaxed) > now()
+    }
+
+    /// Host: hold n0's relay for an hour more, as device `id` may be there
+    /// (we must reach it and do not know where, or heard it there). True when
+    /// that starts it.
+    fn want_n0(&self, id: EndpointId) -> bool {
+        let dev = self.d.peers.get(&id).is_some_and(|p| p.role == Role::Device);
+        let fallback = relay::fallback(&self.d.relays).is_some();
+        if self.d.role != Role::Host || !dev || !fallback {
+            return false;
+        }
+        self.n0_until.swap(now() + 3600, Relaxed) <= now()
     }
 
     fn frame(
@@ -714,6 +738,7 @@ impl Node {
                 let _ = tx.send((to, f));
             }
             None if s.is_empty() => {
+                self.want_n0(st, to);
                 let mut o =
                     self.outbox.lock().unwrap_or_else(|e| e.into_inner());
                 if o.len() >= MAX_OUTBOX {
@@ -722,10 +747,17 @@ impl Node {
                 o.push_back((to, f));
             }
             None => {
+                self.want_n0(st, to);
                 for tx in s.values() {
                     let _ = tx.send((to, f.clone()));
                 }
             }
+        }
+    }
+
+    fn want_n0(&self, st: &State, id: EndpointId) {
+        if st.want_n0(id) {
+            self.changed.notify_one();
         }
     }
 
@@ -766,6 +798,9 @@ impl Node {
             return Ok(());
         };
         st.via.insert(from, url.to_string());
+        if relay::is_n0(url) {
+            self.want_n0(&st, from); // still there: stay
+        }
         match opened {
             Opened::Issued(i, pt) => {
                 self.on_pair_request(&mut st, i, from, &pt)
@@ -1467,9 +1502,12 @@ impl Node {
             let st = self.lock();
             st.join.is_some() || st.home
         };
-        let moved = |st: &State| {
-            st.d.role == Role::Device
-                && st.candidates().first().is_some_and(|r| r.url != url)
+        // Device: a better relay is up; host: this one is no longer needed.
+        let moved = |st: &State| match st.d.role {
+            Role::Device => {
+                st.candidates().first().is_some_and(|r| r.url != url)
+            }
+            Role::Host => !st.listen().iter().any(|r| r.url == url),
         };
         loop {
             tokio::select! {
@@ -1491,8 +1529,13 @@ impl Node {
                             due = probe.map_or(t, |p| p.0);
                         }
                     }
+                    // It left this relay; if we owe it pushes, maybe for n0.
                     In::EndpointGone(id) => {
-                        self.lock().via.retain(|p, u| !(*p == id && u == url));
+                        let mut st = self.lock();
+                        st.via.retain(|p, u| !(*p == id && u == url));
+                        if st.pending.values().any(|p| p.to == id) {
+                            self.want_n0(&st, id);
+                        }
                     }
                     // A relay that pings us (a stock one: every 16-20 s of
                     // our silence) proves the inbound path as a push does,
@@ -1509,7 +1552,7 @@ impl Node {
                             due = Instant::now() + hb(&st);
                         }
                         if moved(&st) {
-                            bail!("moving to preferred relay");
+                            bail!("moving: a better relay, or none needed");
                         }
                     }
                     In::Pong(d) if Some(d) == ping => {
@@ -1549,7 +1592,7 @@ impl Node {
                         }
                         // The radio is awake anyway: no extra wakeup.
                         if moved(&st) {
-                            bail!("moving to preferred relay");
+                            bail!("moving: a better relay, or none needed");
                         }
                         self.rotate(&mut st)?;
                     }
@@ -1719,19 +1762,26 @@ mod tests {
     }
 
     #[test]
-    fn n0_is_always_the_last_resort() {
-        let mut d = Disk::new(
-            Role::Device,
-            Relay::list("https://mesh.example/").unwrap(),
-            Relay::list("https://app.example/").unwrap(),
-        );
-        let st = State::new(Disk::new(Role::Device, d.relays.clone(), vec![]));
-        assert_eq!(
-            st.candidates().iter().map(|r| r.url.as_str()).collect::<Vec<_>>(),
-            ["https://mesh.example/", N0]
-        );
-        d.role = Role::Host;
-        assert_eq!(State::new(d).listen().last().unwrap().url, N0);
+    fn n0_is_the_last_resort() {
+        let mesh = || Relay::list("https://mesh.example/").unwrap();
+        let urls =
+            |l: Vec<Relay>| l.into_iter().map(|r| r.url).collect::<Vec<_>>();
+        let st = State::new(Disk::new(Role::Device, mesh(), vec![]));
+        assert_eq!(urls(st.candidates()), ["https://mesh.example/", N0]);
+        // Hosts hold n0 only while a device may be there...
+        let mut d = Disk::new(Role::Host, mesh(), vec![]);
+        let dev = iroh_base::SecretKey::from_bytes(&rnd()).public();
+        let ek =
+            DecapsulationKey::from(rnd::<32>()).encapsulation_key().clone();
+        d.peers.insert(dev, peer(Role::Device, ek, rnd(), ""));
+        let st = State::new(d);
+        assert_eq!(urls(st.listen()), ["https://mesh.example/"], "idle: no n0");
+        assert!(!st.want_n0(st.id()), "hosts are not looked for there");
+        assert!(st.want_n0(dev) && !st.want_n0(dev), "started once");
+        assert_eq!(urls(st.listen()), ["https://mesh.example/", N0]);
+        // ... and always when it is the mesh's only relay.
+        let zero = State::new(Disk::new(Role::Host, vec![], vec![]));
+        assert_eq!(urls(zero.listen()), [N0]);
         // `!n0` in the mesh relays: no fallback anywhere in the mesh
         let own = Disk::new(
             Role::Device,
@@ -1815,8 +1865,8 @@ mod tests {
         let l = State::new(d).listen();
         assert!(
             l.iter().any(|r| r.url == "https://b.example/")
-                && l.len() == MAX_LISTEN + 1,
-            "one device crowds out no other (+ n0)"
+                && l.len() == MAX_LISTEN,
+            "one device crowds out no other (n0: only on demand)"
         );
     }
 
