@@ -1,0 +1,270 @@
+iroh-relay 1.4.1: the server's ping interval, configurable (proposed upstream).
+
+A relay pings a client after 15 s of its silence. iroh endpoints never see
+it (they ping their relay every 15 s themselves); a silent client, such as
+irpush's device on a phone, is woken by every one. RelayConfig::ping_interval
+(and `ping_interval_secs` in the binary's config) lets an operator raise it,
+default unchanged. `make desktop` builds irpush's own relay (`--serve`)
+against this, pinging members after 130 min, as deploy/relay-ping.patch does
+for the VPS's relay binary.
+
+diff --git a/src/main.rs b/src/main.rs
+index c65dc08..ce2521e 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -151,6 +151,11 @@ struct Config {
+     metrics_bind_addr: Option<SocketAddr>,
+     /// The capacity of the key cache.
+     key_cache_capacity: Option<usize>,
++    /// Seconds a client may stay silent before the relay pings it (default 15).
++    ///
++    /// iroh endpoints ping their relay every 15 s and never see these pings; silent
++    /// clients, such as push receivers on phones, are spared a wakeup per ping.
++    ping_interval_secs: Option<u64>,
+     /// Access control for relaying connections.
+     ///
+     /// This controls which endpoints are allowed to relay connections, other endpoints are not controlled by this.
+@@ -363,6 +368,7 @@ impl Default for Config {
+             enable_metrics: cfg_defaults::enable_metrics(),
+             metrics_bind_addr: None,
+             key_cache_capacity: Default::default(),
++            ping_interval_secs: None,
+             access: AccessConfig::Everyone,
+         }
+     }
+@@ -769,6 +775,9 @@ async fn build_relay_config(cfg: Config) -> Result<relay::ServerConfig> {
+         relay_config.tls = tls_config;
+         relay_config.limits = limits;
+         relay_config.key_cache_capacity = cfg.key_cache_capacity;
++        if let Some(s) = cfg.ping_interval_secs {
++            relay_config.ping_interval = std::time::Duration::from_secs(s);
++        }
+         relay_config.access = cfg.access.clone().try_into()?;
+         Some(relay_config)
+     } else {
+diff --git a/src/server.rs b/src/server.rs
+index b8206d8..9c06b8e 100644
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -58,6 +58,7 @@ use self::http_server::{BytesBody, HyperError, HyperResult};
+ use crate::{
+     defaults::DEFAULT_KEY_CACHE_CAPACITY,
+     http::{AUTH_TOKEN_URL_QUERY_PARAM, ProtocolVersion, RELAY_PROBE_PATH},
++    protos::relay::PING_INTERVAL,
+     quic::server::{QuicServer, QuicSpawnError, ServerHandle as QuicServerHandle},
+     tls::CaTlsConfig,
+ };
+@@ -145,6 +146,15 @@ pub struct RelayConfig {
+     pub key_cache_capacity: Option<usize>,
+     /// Access control for incoming connections.
+     pub access: Arc<dyn DynAccessControl>,
++    /// How long a client may stay silent before the server pings it (plus 1-5 s of
++    /// jitter). Defaults to 15 s.
++    ///
++    /// Clients that keep their connection alive themselves never see these pings: iroh
++    /// endpoints ping their relay every 15 s. A long interval (say two hours) costs
++    /// such clients nothing and lets a client that stays silent, such as a push
++    /// receiver on a phone, sleep between its own keepalives instead of waking every
++    /// 15 s for the relay's.
++    pub ping_interval: Duration,
+ }
+ 
+ impl RelayConfig {
+@@ -160,6 +170,7 @@ impl RelayConfig {
+             limits: Limits::default(),
+             key_cache_capacity: None,
+             access: Arc::new(AllowAll),
++            ping_interval: PING_INTERVAL,
+         }
+     }
+ }
+@@ -733,6 +744,7 @@ impl Server {
+                     .metrics(metrics.server.clone())
+                     .headers(headers)
+                     .key_cache_capacity(key_cache_capacity)
++                    .ping_interval(relay_config.ping_interval)
+                     .access(relay_config.access)
+                     .request_handler(Method::GET, "/", Box::new(root_handler))
+                     .request_handler(Method::GET, "/index.html", Box::new(root_handler))
+diff --git a/src/server/client.rs b/src/server/client.rs
+index 32c77f7..37b395e 100644
+--- a/src/server/client.rs
++++ b/src/server/client.rs
+@@ -63,6 +63,13 @@ pub struct Config<S> {
+     pub channel_capacity: usize,
+     /// Protocol version negotiated for this client
+     pub protocol_version: ProtocolVersion,
++    /// How long the client may stay silent before the server pings it (plus 1-5 s of
++    /// jitter). Any frame from the client restarts it.
++    ///
++    /// Clients that keep their connection alive themselves never see these pings (iroh
++    /// endpoints ping their relay every 15 s). A long interval lets a client that stays
++    /// silent, such as a push receiver on a phone, sleep between its own keepalives.
++    pub ping_interval: Duration,
+     /// Optional signal to inform the client when it is being rate-limited.
+     ///
+     /// When set, the connection actor notifies the client once with a
+@@ -86,6 +93,7 @@ impl<S> Config<S> {
+             protocol_version,
+             write_timeout: SERVER_WRITE_TIMEOUT,
+             channel_capacity: PER_CLIENT_SEND_QUEUE_DEPTH,
++            ping_interval: PING_INTERVAL,
+             rate_limited: None,
+         }
+     }
+@@ -131,6 +139,7 @@ impl Client {
+             write_timeout,
+             channel_capacity,
+             protocol_version,
++            ping_interval,
+             rate_limited,
+         } = config;
+         let endpoint_id = guard.endpoint_id;
+@@ -149,6 +158,7 @@ impl Client {
+             clients: clients.clone(),
+             client_counter: ClientCounter::default(),
+             ping_tracker: PingTracker::default(),
++            ping_interval,
+             protocol_version,
+             rate_limited,
+             metrics,
+@@ -332,6 +342,8 @@ struct Actor<S> {
+     /// Statistics about the connected clients
+     client_counter: ClientCounter,
+     ping_tracker: PingTracker,
++    /// Silence after which the client is pinged (see [`Config::ping_interval`]).
++    ping_interval: Duration,
+     /// Relay protocol version negotiated for this client.
+     protocol_version: ProtocolVersion,
+     /// Optional signal counting how often the connection has been rate-limited.
+@@ -366,9 +378,10 @@ where
+ 
+     async fn run_inner(&mut self, done: CancellationToken) -> Result<(), RunError> {
+         // Add some jitter to ping pong interactions, to avoid all pings being sent at the same time
+-        let next_interval = || {
++        let ping_interval = self.ping_interval;
++        let next_interval = move || {
+             let random_secs = rand::rng().random_range(1..=5);
+-            Duration::from_secs(random_secs) + PING_INTERVAL
++            Duration::from_secs(random_secs) + ping_interval
+         };
+ 
+         let mut ping_interval = tokio::time::interval(next_interval());
+@@ -734,6 +747,27 @@ mod tests {
+         (config, Conn::test(client, protocol_version))
+     }
+ 
++    /// A silent client is pinged after the configured interval, not before.
++    #[tokio::test(start_paused = true)]
++    #[traced_test]
++    async fn test_ping_interval() -> Result {
++        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(42u64);
++        let key = SecretKey::from_bytes(&rng.random()).public();
++        let (mut config, mut rw) = test_client_builder(key, ProtocolVersion::V2);
++        config.ping_interval = Duration::from_secs(3600);
++        let clients = Clients::default();
++        clients.register(config, Arc::new(Metrics::default()));
++
++        let early = tokio::time::timeout(Duration::from_secs(3590), rw.next()).await;
++        assert!(early.is_err(), "pinged before the interval");
++        let ping = recv_frame(FrameType::Ping, &mut rw);
++        let frame = tokio::time::timeout(Duration::from_secs(20), ping).await.anyerr()??;
++        assert!(matches!(frame, RelayToClientMsg::Ping(_)));
++
++        clients.shutdown().await;
++        Ok(())
++    }
++
+     #[tokio::test]
+     #[traced_test]
+     async fn test_client_v1_protocol() -> Result {
+diff --git a/src/server/http_server.rs b/src/server/http_server.rs
+index a774bf6..551dc66 100644
+--- a/src/server/http_server.rs
++++ b/src/server/http_server.rs
+@@ -42,7 +42,11 @@ use crate::{
+         CLIENT_AUTH_HEADER, ProtocolVersion, RELAY_PATH, SUPPORTED_WEBSOCKET_VERSION,
+         WEBSOCKET_UPGRADE_PROTOCOL,
+     },
+-    protos::{handshake, relay::MAX_FRAME_SIZE, streams::WsBytesFramed},
++    protos::{
++        handshake,
++        relay::{MAX_FRAME_SIZE, PING_INTERVAL},
++        streams::WsBytesFramed,
++    },
+     server::{
+         ClientRateLimit,
+         client::Config,
+@@ -354,6 +358,8 @@ pub(super) struct ServerBuilder {
+     access: Arc<dyn DynAccessControl>,
+     metrics: Option<Arc<Metrics>>,
+     establish_timeout: Duration,
++    /// Silence after which a client is pinged.
++    ping_interval: Duration,
+ }
+ 
+ impl ServerBuilder {
+@@ -369,6 +375,7 @@ impl ServerBuilder {
+             access: Arc::new(AllowAll),
+             metrics: None,
+             establish_timeout: ESTABLISH_TIMEOUT,
++            ping_interval: PING_INTERVAL,
+         }
+     }
+ 
+@@ -432,6 +439,12 @@ impl ServerBuilder {
+         self
+     }
+ 
++    /// Sets how long a client may stay silent before the server pings it.
++    pub(super) fn ping_interval(mut self, interval: Duration) -> Self {
++        self.ping_interval = interval;
++        self
++    }
++
+     /// Set the capacity of the cache for public keys.
+     pub(super) fn key_cache_capacity(mut self, capacity: usize) -> Self {
+         self.key_cache_capacity = capacity;
+@@ -450,6 +463,7 @@ impl ServerBuilder {
+             self.access,
+             self.metrics.unwrap_or_default(),
+         );
++        service.set_ping_interval(self.ping_interval);
+ 
+         let addr = self.addr;
+         let tls_config = self.tls_config;
+@@ -536,6 +550,7 @@ struct Inner {
+     key_cache: KeyCache,
+     access: Arc<dyn DynAccessControl>,
+     metrics: Arc<Metrics>,
++    ping_interval: watch::Sender<Duration>,
+ }
+ 
+ #[stack_error(derive, add_meta)]
+@@ -888,6 +903,7 @@ impl Inner {
+         trace!("accept: build client conn");
+         let mut client_conn_builder = Config::new(guard, io, protocol_version);
+         client_conn_builder.write_timeout = self.write_timeout;
++        client_conn_builder.ping_interval = *self.ping_interval.borrow();
+         client_conn_builder.rate_limited = Some(limited_watcher);
+         trace!(endpoint_id = %request.endpoint_id().fmt_short(), "create client");
+ 
+@@ -930,9 +946,18 @@ impl RelayService {
+             key_cache,
+             access,
+             metrics,
++            ping_interval: watch::Sender::new(PING_INTERVAL),
+         }))
+     }
+ 
++    /// Sets how long a client may stay silent before the server pings it.
++    ///
++    /// Applies to connections accepted from now on. See
++    /// [`RelayConfig::ping_interval`](crate::server::RelayConfig::ping_interval).
++    pub fn set_ping_interval(&self, interval: Duration) {
++        self.0.ping_interval.send_replace(interval);
++    }
++
+     /// Updates the per-client receive rate limit.
+     ///
+     /// The new rate limit will be applied to all current and future client connections.

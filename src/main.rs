@@ -7,6 +7,8 @@ usage:
                      relays, devices only)
   irpush DIR run [RELAYS]          run; prints \"sender app data\" (hex) per \
                      push; serves DIR/sock
+  irpush DIR run [RELAYS] --serve PORT   ... and this host's own relay on \
+                     PORT (TCP): members only, its port mapped by the router
   irpush DIR attach APP [APP...]   stream the pushes for these apps from the \
                      running node (any user program)
   irpush DIR ticket [host]         one-time ticket, valid 10 min (treat as a \
@@ -142,7 +144,13 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "irpush=info".into()),
         )
         .init();
-    let a: Vec<String> = std::env::args().skip(1).collect();
+    let mut a: Vec<String> = std::env::args().skip(1).collect();
+    // `--serve PORT`: this host's own relay.
+    let serve = match a.iter().position(|x| x == "--serve") {
+        Some(i) if i + 1 < a.len() => Some(a.drain(i..i + 2).nth(1).unwrap()),
+        Some(_) => bail!("--serve PORT"),
+        None => None,
+    };
     let a: Vec<&str> = a.iter().map(String::as_str).collect();
     let (dir, cmd, rest) = match a.as_slice() {
         [d, c, r @ ..] => (Path::new(d), *c, r),
@@ -193,6 +201,19 @@ async fn main() -> Result<()> {
     };
     let (node, _lock) = (Arc::new(node.0), node.1);
     tracing::info!(id = %node.id(), role = ?node.role(), "started");
+    #[cfg(feature = "serve")]
+    let _served = match serve {
+        Some(p) => {
+            let bind = (std::net::Ipv6Addr::UNSPECIFIED, p.parse()?).into();
+            let s = irpush::serve::serve(&node, dir, bind).await?;
+            let a = irpush::serve::announce(node.clone(), s.addr.port(), s.pin);
+            tokio::spawn(a);
+            Some(s)
+        }
+        None => None,
+    };
+    #[cfg(not(feature = "serve"))]
+    ensure!(serve.is_none(), "--serve: built without the serve feature");
     // DIR/sock: commands and `attach` streams, own uid only (0700 dir + peer
     // credential check).
     let (l, uid) = (

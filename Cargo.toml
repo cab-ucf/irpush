@@ -1,6 +1,6 @@
 [package]
 name = "irpush"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 rust-version = "1.89"
 license = "GPL-3.0-or-later"
@@ -28,11 +28,19 @@ url = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-std", "io-util", "fs"] }
 x-wing = { version = "0.1.1", features = ["getrandom", "zeroize"] }
 zeroize = "1"
+# serve: a host's own relay (self-signed, pinned), behind a mapped port.
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"], optional = true }
+portmapper = { version = "0.20", default-features = false, optional = true }
 
 [lib]
 crate-type = ["lib", "staticlib"] # staticlib: iOS xcframework
 
 [features]
+# A host's own relay (desktops): `irpush DIR run --serve PORT`.
+serve = ["iroh-relay/server", "dep:rcgen", "dep:portmapper"]
+# ... pinging members after 130 min: needs iroh-relay with
+# deploy/iroh-relay-ping-interval.patch (`make desktop`).
+relay-ping = ["serve"]
 ffi = []
 jni = ["dep:jni"] # for android/: enable in the app's own native library
 

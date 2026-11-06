@@ -13,6 +13,12 @@ irch's plan (the why): irch's PLAN.md.
 - [ ] Deploy from the app: a VPS provider's API token in, a relay out
       (cloud-init, a signed static binary, an IP certificate or the
       provider's DNS); or a storage node with a public address serves one
+- [x] A desktop as the relay (`run --serve PORT`): members only, its
+      certificate pinned in its address, the port mapped by the router
+- [ ] Its addresses for devices off every relay: published under the
+      host's key (pkarr), so a moved home IP is found without a fallback
+- [ ] Upstream the ping interval (deploy/iroh-relay-ping-interval.patch):
+      then n0's relays could leave silent clients alone too
 
 ## One socket per device
 - [x] Events: any two nodes on one relay, one datagram each (`Node::event`)
