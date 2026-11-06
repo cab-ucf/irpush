@@ -83,6 +83,7 @@ relay can link a device's sessions over time. Device-suggested relays must be `h
     irpush ~/.irpush create                                  # first host (zero infrastructure)
     irpush ~/.irpush create "https://irpush.you.example"   # ... or preferring your relay
     irpush ~/.irpush run &                                   # as a service (systemd)
+    irpush ~/.irpush run --serve 7843 &                      # ... and its own relay (no VPS, below)
     irpush ~/.irpush ticket host | qrencode -t ansiutf8      # add a host
     irpush ~/.irpush ticket                                  # add a device (in-band or QR)
     irpush NEWDIR join TICKET                                # on the new node, then `run`
@@ -153,6 +154,22 @@ this late is no ring). Each wakes the app, which opens it on the phone and repor
 
     Irpush.voip { m, done in /* CXProvider.reportNewIncomingCall(...) for m (nil: a duplicate, end it) */ done() }
 
+## A desktop as the relay (no VPS)
+`irpush DIR run --serve 7843` (built with `--features serve`; `make desktop`, below) also serves
+this host's own relay on TCP 7843, to its mesh only: this host, its peers, and a ticket's holder
+while the ticket is unused. Its certificate is self-signed, made once in DIR (`relay.crt`,
+`relay.key`); its SHA-256 rides in the relay's address (`https://IP:PORT/#sha256=…`) in tickets and
+the mesh's relays, so devices trust exactly it: no domain, no certificate authority. The host asks
+its router for the port (UPnP, PCP, NAT-PMP: at start, then every 30 min while it has none, never in
+a loop) and puts the mapped address, its global IPv6 address and its LAN address first among the
+mesh's relays; it reaches its own relay over loopback. Where none of them reaches (carrier-grade
+NAT, a firewall that drops inbound IPv6), devices use the mesh's other relays, n0's last. The relay
+sees its members' IPs and timing, like any relay; the desktop exposes one TLS port, members only.
+
+A stock relay pings every 16-20 s. `make desktop` builds against iroh-relay with
+`deploy/iroh-relay-ping-interval.patch` (a configurable ping interval, proposed upstream): members
+are pinged after 130 min, as by the VPS's relay, and drive their own learned heartbeats.
+
 ## Your own relay (optional VPS)
 `irpush.<you>` is iroh's relay with one change: it pings a client only after 130 min of silence
 instead of 16-20 s, so phones drive their own learned heartbeats (up to 2 h). It is open:
@@ -208,7 +225,8 @@ from memory when dropped.
 
 ## Tests
 `cargo test`: frame crypto (binding, tamper, freshness), state round trip, relay parsing, APNs JWT and
-per-app routes, an end-to-end mesh over an in-process relay (late-host pairing, introductions, two
+per-app routes, a host's own relay (pairing and pushing through it, pinned; strangers and other
+certificates refused; with `make desktop`'s relay, members left to sleep), an end-to-end mesh over an in-process relay (late-host pairing, introductions, two
 hosts, offline queue, parking with no network, revocation, identity and key guards), the shared node
 (attach, device id, fall-through to the owner, refused attach, single owner), the `!n0` opt-out, PSK
 mixing against a forging introducer, per-device listen slots, n0 on demand, a pinging relay as the

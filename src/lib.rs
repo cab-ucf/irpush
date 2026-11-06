@@ -27,6 +27,8 @@ mod jni;
 pub mod local;
 mod proto;
 mod relay;
+#[cfg(feature = "serve")]
+pub mod serve;
 mod store;
 
 pub use apns::Svc;
@@ -56,7 +58,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
-        Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     },
     time::Duration,
@@ -399,6 +401,9 @@ pub struct Node {
     paused: AtomicBool,
     // Relay in use (device), for "using the n0 fallback" notices.
     relay: watch::Sender<Option<String>>,
+    // Host: its own relay (`serve`): port and certificate pin. It dials it
+    // over loopback: a router may not route its public address back in.
+    served: std::sync::OnceLock<(u16, [u8; 32])>,
 }
 
 /// iOS Notification Service Extension: decrypt an APNs payload's `f` field with
@@ -496,6 +501,21 @@ impl Node {
         Ok(())
     }
 
+    /// Host's own relay: who may use it. This node, its peers, and anyone
+    /// while one of its tickets is unused (its holder is unknown until it
+    /// pairs, which it does through this relay).
+    pub fn admits(&self, id: &EndpointId) -> bool {
+        let (st, t) = (self.lock(), Instant::now());
+        *id == st.id()
+            || st.d.peers.contains_key(id)
+            || st.secrets.iter().any(|s| s.exp > t && s.used.is_none())
+    }
+
+    /// Host: its own relay runs on `port` with this certificate (`serve`).
+    pub fn set_served(&self, port: u16, pin: [u8; 32]) {
+        let _ = self.served.set((port, pin));
+    }
+
     /// Whether `id` is our peer (e.g. a ticket's host, once joined).
     pub fn has(&self, id: &EndpointId) -> bool {
         self.lock().d.peers.contains_key(id)
@@ -531,6 +551,7 @@ impl Node {
             changed: Notify::new(),
             paused: AtomicBool::new(false),
             relay: watch::channel(None).0,
+            served: Default::default(),
         };
         n.save(&n.lock())?;
         Ok(n)
@@ -1351,9 +1372,19 @@ impl Node {
                 return fixed.unwrap_or_default();
             }
             for r in cands {
-                let Ok(url) = r.url.parse::<RelayUrl>() else { continue };
+                let own = self.served.get().filter(|s| Some(s.1) == r.pin);
+                let url = match own {
+                    Some((port, _)) => format!("https://127.0.0.1:{port}/"),
+                    None => r.url.clone(),
+                };
+                let Ok(url) = url.parse::<RelayUrl>() else { continue };
+                let tls = match r.pin {
+                    Some(pin) => pinned(pin),
+                    None => Ok(tlsc.clone()),
+                };
+                let Ok(tls) = tls else { continue };
                 let b = ClientBuilder::new(url, sk.clone(), dns.clone())
-                    .tls_client_config(tlsc.clone());
+                    .tls_client_config(tls);
                 match timeout(Duration::from_secs(8), b.connect()).await {
                     Ok(Ok(c)) => {
                         self.lock().down.remove(&r.url);
@@ -1717,10 +1748,64 @@ impl Node {
     }
 }
 
+/// TLS that trusts exactly the certificate whose SHA-256 is `pin` (a host's
+/// own relay, self-signed), whatever name or address it is reached at.
+fn pinned(pin: [u8; 32]) -> Result<rustls::ClientConfig> {
+    use rustls::client::danger::ServerCertVerifier;
+    let v = move |p| Ok(Arc::new(Pin(pin, p)) as Arc<dyn ServerCertVerifier>);
+    let ca = tls::CaTlsConfig::custom_server_cert_verifier(Arc::new(v));
+    Ok(ca.client_config(pq())?)
+}
+
+#[derive(Debug)]
+struct Pin([u8; 32], Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for Pin {
+    fn verify_server_cert(
+        &self,
+        cert: &rustls::pki_types::CertificateDer,
+        _: &[rustls::pki_types::CertificateDer],
+        _: &rustls::pki_types::ServerName,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        use sha2::Digest;
+        match sha2::Sha256::digest(cert)[..] == self.0 {
+            true => Ok(rustls::client::danger::ServerCertVerified::assertion()),
+            false => Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            )),
+        }
+    }
+    fn verify_tls12_signature(
+        &self,
+        m: &[u8],
+        c: &rustls::pki_types::CertificateDer,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+    {
+        let algs = &self.1.signature_verification_algorithms;
+        rustls::crypto::verify_tls12_signature(m, c, d, algs)
+    }
+    fn verify_tls13_signature(
+        &self,
+        m: &[u8],
+        c: &rustls::pki_types::CertificateDer,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+    {
+        let algs = &self.1.signature_verification_algorithms;
+        rustls::crypto::verify_tls13_signature(m, c, d, algs)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.1.signature_verification_algorithms.supported_schemes()
+    }
+}
+
 /// aws-lc-rs, X25519MLKEM768 first. Never iroh-relay's `default_provider`: it
 /// is ring (classical) whenever the embedding app's iroh enables `tls-ring`, as
 /// iroh's defaults do.
-fn pq() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
+pub(crate) fn pq() -> Arc<rustls::crypto::CryptoProvider> {
     rustls::crypto::aws_lc_rs::default_provider().into()
 }
 
